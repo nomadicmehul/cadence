@@ -7,5 +7,5 @@ Short version: be kind, assume good faith, help newcomers, and don't harass
 anyone. Disagree about technical decisions in the open and in writing — keep
 it about the work.
 
-Reports of unacceptable behavior go to mehul.patel@buildingminds.com. All
+Reports of unacceptable behavior go to hello@nomadicmehul.dev. All
 reports will be reviewed and kept confidential.

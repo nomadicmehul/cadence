@@ -18,7 +18,7 @@ both of us time.
 ## Setup
 
 ```bash
-git clone https://github.com/<your-fork>/cadence.git
+git clone https://github.com/nomadicmehul/cadence.git
 cd cadence
 ./run.sh        # creates .venv, installs deps, starts the server
 ```

@@ -18,7 +18,7 @@ Nothing leaves your machine except the prompts you send to Claude.
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-fork>/cadence.git
+git clone https://github.com/nomadicmehul/cadence.git
 cd cadence
 chmod +x run.sh
 ./run.sh
@@ -73,7 +73,7 @@ moving to a trusted machine and don't want to re-paste.
 On the **new** machine:
 
 ```bash
-git clone https://github.com/<your-fork>/cadence.git
+git clone https://github.com/nomadicmehul/cadence.git
 cd cadence
 ./run.sh                                 # creates DB with default seeds
 # stop the server (Ctrl-C), then:
@@ -148,7 +148,7 @@ and is combined with your live voice samples on every call.
 PRs welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first — there are some
 hard constraints (no build step, no new heavy deps without discussion).
 
-For security issues, email mehul.patel@buildingminds.com — see
+For security issues, email hello@nomadicmehul.dev — see
 [SECURITY.md](SECURITY.md).
 
 ---

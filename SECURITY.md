@@ -21,7 +21,7 @@ password manager export.
 
 If you find a security bug — credential leak, injection, sandbox escape,
 anything that could harm a user — **do not open a public issue**. Email
-mehul.patel@buildingminds.com with the details and we'll respond within
+hello@nomadicmehul.dev with the details and we'll respond within
 72 hours.
 
 ## What we already protect against
