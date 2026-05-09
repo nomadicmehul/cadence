@@ -143,6 +143,12 @@ and is combined with your live voice samples on every call.
 
 ---
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for what's shipped, what's planned (semantic
+memory, daily reflection, topic search, reusable Claude skills), and what's
+deliberately out of scope.
+
 ## Contributing
 
 PRs welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first — there are some
