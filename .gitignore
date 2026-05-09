@@ -1,0 +1,24 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.bak
+data/*.db
+data/*.db-journal
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Backups exported from the app — these contain your unpublished posts and
+# (optionally) your API key. Don't ever check them in.
+*.backup.json
+linkedin-growth-backup-*.json

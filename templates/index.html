@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cadence · LinkedIn content pipeline</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">in</div>
+    <div>
+      <div class="brand-title">Cadence</div>
+      <div class="brand-sub" id="brand-sub">Loading…</div>
+    </div>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button data-tab="dashboard" class="active">Dashboard</button>
+    <button data-tab="ideas">Ideas</button>
+    <button data-tab="drafts">Drafts</button>
+    <button data-tab="calendar">Calendar</button>
+    <button data-tab="analytics">Analytics</button>
+    <button data-tab="engagement">Engagement</button>
+    <button data-tab="voice">Voice</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+  <div class="api-status" id="api-status" title="Anthropic API key status">
+    <span class="dot"></span><span id="api-status-label">key?</span>
+  </div>
+</header>
+
+<main id="app">
+
+  <!-- DASHBOARD ----------------------------------------------------------->
+  <section class="view active" id="view-dashboard">
+    <div class="row stat-row" id="stat-row"></div>
+
+    <div class="row">
+      <div class="card span-2">
+        <div class="card-head">
+          <h3>Up next</h3>
+          <span class="muted">Scheduled posts in the queue</span>
+        </div>
+        <div id="next-up"></div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <h3>Pillar mix</h3>
+          <span class="muted">Published posts per pillar</span>
+        </div>
+        <div id="pillar-mix"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card span-2">
+        <div class="card-head">
+          <h3>Quick actions</h3>
+          <span class="muted">Stay in flow</span>
+        </div>
+        <div class="quick-actions">
+          <button class="btn primary" data-jump="ideas" data-action="generate">+ Generate ideas</button>
+          <button class="btn" data-jump="drafts" data-action="new">+ New draft</button>
+          <button class="btn" data-jump="calendar" data-action="autoschedule">Auto-schedule queue</button>
+          <button class="btn" data-jump="analytics" data-action="insights">Run insights</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <h3>Totals</h3>
+          <span class="muted">All-time logged engagement</span>
+        </div>
+        <div id="totals"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card span-3" style="grid-column: span 3">
+        <div class="card-head">
+          <h3>Memory snapshot</h3>
+          <span class="muted">What the AI is drawing from when it generates for you</span>
+        </div>
+        <div id="memory-snapshot"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- IDEAS --------------------------------------------------------------->
+  <section class="view" id="view-ideas">
+    <div class="view-head">
+      <h2>Ideas Bank</h2>
+      <div class="head-actions">
+        <select id="idea-pillar-filter"><option value="">All pillars</option></select>
+        <select id="idea-status-filter">
+          <option value="">All status</option>
+          <option value="raw">Raw</option>
+          <option value="drafted">Drafted</option>
+          <option value="discarded">Discarded</option>
+        </select>
+        <button class="btn" id="idea-add">+ Manual</button>
+        <button class="btn primary" id="idea-generate">+ Generate with Claude</button>
+      </div>
+    </div>
+    <div id="ideas-list" class="grid"></div>
+  </section>
+
+  <!-- DRAFTS -------------------------------------------------------------->
+  <section class="view" id="view-drafts">
+    <div class="view-head">
+      <h2>Drafts</h2>
+      <div class="head-actions">
+        <select id="draft-status-filter">
+          <option value="">All status</option>
+          <option value="draft">Draft</option>
+          <option value="ready">Ready</option>
+          <option value="scheduled">Scheduled</option>
+          <option value="published">Published</option>
+        </select>
+        <button class="btn primary" id="draft-new">+ New draft</button>
+      </div>
+    </div>
+    <div class="split">
+      <div id="drafts-list" class="list"></div>
+      <div id="draft-editor" class="editor empty">
+        <div class="empty-state">Select a draft on the left, or click <b>+ New draft</b>.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CALENDAR ------------------------------------------------------------>
+  <section class="view" id="view-calendar">
+    <div class="view-head">
+      <h2>Calendar</h2>
+      <div class="head-actions">
+        <button class="btn" id="cal-prev">←</button>
+        <span id="cal-label" class="cal-label"></span>
+        <button class="btn" id="cal-next">→</button>
+        <button class="btn primary" id="cal-auto">Auto-schedule ready drafts</button>
+      </div>
+    </div>
+    <div id="calendar-grid" class="cal-grid"></div>
+  </section>
+
+  <!-- ANALYTICS ----------------------------------------------------------->
+  <section class="view" id="view-analytics">
+    <div class="view-head">
+      <h2>Analytics</h2>
+      <div class="head-actions">
+        <button class="btn" id="analytics-add">+ Log a post</button>
+        <button class="btn" id="analytics-import">Import LinkedIn CSV</button>
+        <button class="btn primary" id="analytics-insights">What's working?</button>
+      </div>
+    </div>
+    <div class="card" id="insights-card" style="display:none">
+      <div class="card-head"><h3>Claude insights</h3></div>
+      <pre id="insights-text" class="insights-text"></pre>
+    </div>
+    <div id="analytics-list" class="grid"></div>
+  </section>
+
+  <!-- ENGAGEMENT ---------------------------------------------------------->
+  <section class="view" id="view-engagement">
+    <div class="view-head">
+      <h2>Engagement</h2>
+      <div class="head-actions">
+        <button class="btn" id="eng-comments">+ Generate comments</button>
+        <button class="btn primary" id="eng-add">+ New task</button>
+      </div>
+    </div>
+    <div id="engagement-list" class="list"></div>
+  </section>
+
+  <!-- VOICE --------------------------------------------------------------->
+  <section class="view" id="view-voice">
+    <div class="view-head">
+      <h2>Voice library</h2>
+      <p class="muted">
+        Paste 5–10 of your best past posts. Claude samples 3 at random for every
+        generation, so the model writes in YOUR rhythm.
+      </p>
+      <div class="head-actions">
+        <button class="btn primary" id="voice-add">+ Add sample</button>
+      </div>
+    </div>
+    <div id="voice-list" class="grid"></div>
+  </section>
+
+  <!-- SETTINGS ------------------------------------------------------------>
+  <section class="view" id="view-settings">
+    <div class="view-head"><h2>Settings</h2></div>
+    <div class="card">
+      <div class="card-head">
+        <h3>AI backend</h3>
+        <span class="muted tiny" id="auth-summary">checking…</span>
+      </div>
+      <p class="muted">
+        Pick whichever you prefer. The tool auto-detects which one is available
+        and uses it. <b>API key wins</b> if both are set.
+      </p>
+
+      <div class="auth-grid">
+        <div class="auth-card" id="auth-card-cli">
+          <div class="auth-head">
+            <span class="dot" id="auth-cli-dot"></span>
+            <b>Claude Code CLI</b>
+            <span class="status-chip" id="auth-cli-chip">checking</span>
+          </div>
+          <p class="muted tiny" id="auth-cli-detail">Detecting <code>claude</code> on PATH…</p>
+          <p class="muted tiny">
+            If you've already used Claude Code, you're done. Otherwise install
+            it and run <code>claude login</code> (browser auth) once.
+          </p>
+          <a class="btn sm" href="https://docs.claude.com/en/docs/claude-code" target="_blank">
+            Install Claude Code ↗
+          </a>
+        </div>
+
+        <div class="auth-card" id="auth-card-api">
+          <div class="auth-head">
+            <span class="dot" id="auth-api-dot"></span>
+            <b>Anthropic API key</b>
+            <span class="status-chip" id="auth-api-chip">not set</span>
+          </div>
+          <p class="muted tiny">Stored locally in <code>data/pipeline.db</code>.</p>
+          <div class="form-row" style="gap:6px">
+            <input type="password" id="set-api-key" placeholder="sk-ant-…" />
+            <button class="btn primary" id="save-api-key">Save</button>
+          </div>
+          <div class="ed-row" style="gap:6px;margin-top:6px">
+            <button class="btn sm danger" id="clear-api-key" hidden>Remove saved key</button>
+            <a class="btn sm ghost" href="https://console.anthropic.com/" target="_blank">
+              Get a key ↗
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <div class="ed-row" style="margin-top:14px">
+        <button class="btn primary" id="test-auth">Test connection</button>
+        <span class="muted tiny" id="test-auth-out"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Creator profile</h3></div>
+      <label>Name<input id="set-name" /></label>
+      <label>Handle<input id="set-handle" /></label>
+      <label>Bio
+        <textarea id="set-bio" rows="3"></textarea>
+      </label>
+      <label>Target audience
+        <textarea id="set-audience" rows="2"></textarea>
+      </label>
+      <div class="row form-row">
+        <label>Weekly post target<input id="set-weekly" type="number" min="1" max="14" /></label>
+        <label>Preferred hours (HH:MM, comma-sep)
+          <input id="set-hours" placeholder="09:00,12:30,17:30" />
+        </label>
+        <label>Default format
+          <select id="set-format">
+            <option value="story">Story</option>
+            <option value="list">List</option>
+            <option value="contrarian">Contrarian</option>
+            <option value="tutorial">Tutorial</option>
+            <option value="bts">Behind the scenes</option>
+            <option value="carousel">Carousel</option>
+          </select>
+        </label>
+      </div>
+      <button class="btn primary" id="save-profile">Save profile</button>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Content pillars</h3></div>
+      <div id="pillar-list"></div>
+      <button class="btn" id="pillar-add">+ Add pillar</button>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Backup &amp; migrate</h3></div>
+      <p class="muted">
+        Move to a new computer in 60 seconds. Export downloads a JSON of every
+        idea, draft, voice sample, and analytics row. Import wipes the current
+        DB and restores it on the new machine. The API key is stripped from
+        exports by default — paste it again on the new machine.
+      </p>
+      <div class="ed-row">
+        <button class="btn primary" id="backup-export">Download backup</button>
+        <button class="btn" id="backup-import">Restore from backup…</button>
+        <input type="file" id="backup-file" accept="application/json,.json" hidden />
+        <span class="muted tiny" id="backup-status"></span>
+      </div>
+      <p class="muted tiny" style="margin-top:10px">
+        For headless / scripted use, run
+        <code>python app.py export backup.json</code> and
+        <code>python app.py import backup.json</code> from the project root.
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<!-- MODAL -->
+<div class="modal-backdrop" id="modal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="modal-title">Modal</h3>
+      <button class="x" id="modal-close">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<!-- TOASTS -->
+<div id="toasts" class="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
