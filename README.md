@@ -174,7 +174,7 @@ gracefully.
 | **Analytics** | Log impressions/likes/comments/follows per published post. Import LinkedIn's Creator Analytics xlsx export. Auto-matches rows to your drafts. **What's working?** gives a one-paragraph Claude analysis. |
 | **Engagement** | Task list for comments + follow-ups. Comment generator writes 3 thoughtful comments for any post text you paste in. Comments now match your voice samples (the voice block is injected on every call). URL-only input is rejected with a clear error — Cadence can't fetch LinkedIn URLs. |
 | **Voice** | Library of your past posts. Claude samples 3 at random for every generation, so the AI writes in *your* rhythm, not generic AI prose. |
-| **Settings** | API key, creator profile, pillars (with target % and color), backup/restore. |
+| **Settings** | API key, **model picker** (Opus 4.5 / Sonnet 4.5 / Haiku 4.5 or pin a custom version; setting persists across restarts, top-bar pill shows what's live), creator profile, content pillars (with target % and color). Backup &amp; migrate offers three formats: **JSON** for full machine round-trips, **`profile.md`** for human-editable settings + pillars + voice + sources, **markdown `.zip`** for the whole DB with one file per draft (git-friendly). |
 
 ---
 
@@ -224,6 +224,16 @@ See [ROADMAP.md](ROADMAP.md) for the full status.
   Cadence finds the feed for you).
 - Comment generator now injects voice samples on every call and rejects
   URL-only input with an actionable error.
+- **Live model picker.** Switch between Opus 4.5, Sonnet 4.5, Haiku 4.5,
+  or pin a specific version from Settings → AI backend. The DB-saved
+  choice wins over the `CLAUDE_MODEL` env var; the top-bar pill shows
+  which model is active per generation.
+- **Human-editable backups.** `profile.md` round-trips your creator
+  profile, content pillars, voice samples, and topic sources as plain
+  markdown with YAML-style frontmatter. The markdown `.zip` archive
+  extends that to the whole DB, with one file per draft so edits in any
+  text editor become single-line diffs in git. Both imports are
+  **additive** (UPSERT, never delete) so they're safe to re-run.
 
 **Still planned:**
 - Semantic memory via embeddings (so discarded patterns dedupe by meaning,
