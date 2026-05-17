@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -2653,23 +2654,56 @@ def api_engagement_delete(eid):
     return jsonify({"ok": True})
 
 
+_URL_ONLY_RE = re.compile(r"^https?://\S+$")
+
+
 @app.post("/api/engagement/comments")
 def api_engagement_comments():
-    """Generate 3 thoughtful comment templates for a target post snippet."""
-    p = request.get_json(force=True)
-    target = p.get("target_post", "")
-    if not target.strip():
-        return jsonify({"ok": False, "error": "Provide target_post"}), 400
+    """Generate 3 thoughtful comment templates for a target post.
 
-    system = SYSTEM_BASE + "\n\n" + creator_block()
+    Requires the BODY TEXT of the post, not a URL — Claude has no way to
+    fetch URLs from here. We reject URL-only input with a clear 400 so the
+    spinner doesn't hang while Claude hallucinates against a slug.
+    """
+    p = request.get_json(force=True)
+    target = (p.get("target_post") or "").strip()
+    if not target:
+        return jsonify({
+            "ok": False,
+            "error": "Paste the body text of the LinkedIn post (not a URL).",
+        }), 400
+    if _URL_ONLY_RE.match(target):
+        return jsonify({
+            "ok": False,
+            "error": ("That looks like just a URL. Cadence can't fetch "
+                      "LinkedIn URLs. Open the post on LinkedIn, copy the "
+                      "post text, and paste that instead."),
+        }), 400
+
+    # Two-block system: static portion (with voice samples!) marked cacheable.
+    # voice_block was previously omitted here, which silently bypassed the
+    # voice-consistency rule. Comments now actually sound like the creator.
+    static_system = (
+        SYSTEM_BASE + "\n\n" + creator_block() + voice_block()
+        + "\n\nYou are writing comments the creator will leave on someone "
+          "else's LinkedIn post. Comments must read in the creator's voice "
+          "as shown in the samples above. No 'great post!' sycophancy. "
+          "Each comment must add a specific story, data point, or counterpoint."
+    )
+    system = [
+        {"type": "text", "text": static_system,
+         "cache_control": {"type": "ephemeral"}},
+    ]
+
     user = textwrap.dedent(f"""
         Write 3 short LinkedIn comments to leave on this post. Each comment must:
         - Add value (specific story, example, or counterpoint)
-        - Sound like the creator
+        - Sound like the creator (match the voice samples above)
         - Be 2-4 lines max
         - Not be sycophantic ("great post!" / "amazing!" — banned)
+        - Not summarise the post back at the author
 
-        TARGET POST:
+        TARGET POST (this is the body text the user wants to comment on):
         ---
         {target}
         ---
