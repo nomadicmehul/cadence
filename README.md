@@ -108,13 +108,14 @@ gracefully.
 
 | Tab | What it does |
 |---|---|
-| **Dashboard** | Pipeline counts, what's up next, pillar mix, all-time engagement totals, "Memory snapshot" card showing exactly what context the AI sees. |
-| **Ideas** | Generate batches of ideas with Claude (hook + angle + format). Filter by pillar/status. Convert any idea into a draft in one click. |
-| **Drafts** | Split-pane composer. Generate, rewrite ("tighter", "more contrarian"), score (Hook 1-10 / Voice 1-10), copy to clipboard, schedule. |
+| **Dashboard** | Pipeline counts, what's up next, pillar mix, all-time engagement totals. **This week's signal** card runs the weekly brain reflection — Claude reads your last 7 days of analytics, voice samples, and discards, writes a paragraph on what's working, and drops 3 fresh ideas into the Ideas Bank tagged `auto-reflection`. **Memory snapshot** shows exactly what context the AI sees. |
+| **Topics** | Pull headlines from RSS / Atom feeds (Hacker News and dev.to seeded by default). Feed autodiscovery means a regular blog URL like `https://dev.to/t/googlecloud` resolves to the underlying feed automatically. One click turns any topic into an angled idea in your voice, tagged `topic-intake` with the source URL preserved. |
+| **Ideas** | Generate batches of ideas with Claude (hook + angle + format). Filter by pillar/status. Convert any idea into a draft in one click. Discarded ideas (and anything semantically similar) get blocked from re-pitching. |
+| **Drafts** | Split-pane composer. Generate, rewrite ("tighter", "more contrarian"), score (Hook 1-10 / Voice 1-10), copy to clipboard, schedule. Winners feed back as positive examples on every future generation. |
 | **Calendar** | Month grid of scheduled posts. **Auto-schedule** spreads ready drafts across weekdays at your preferred hours, balanced by pillar. |
-| **Analytics** | Log impressions/likes/comments/follows per published post. Import LinkedIn's Creator Analytics xlsx export — auto-matches rows to your drafts. **What's working?** gives a one-paragraph Claude analysis. |
-| **Engagement** | Task list for comments + follow-ups. Comment generator writes 3 thoughtful comments for any post you paste in. |
-| **Voice** | Library of your past posts. Claude samples 3 at random for every generation, so the AI writes in *your* rhythm — not generic AI prose. |
+| **Analytics** | Log impressions/likes/comments/follows per published post. Import LinkedIn's Creator Analytics xlsx export. Auto-matches rows to your drafts. **What's working?** gives a one-paragraph Claude analysis. |
+| **Engagement** | Task list for comments + follow-ups. Comment generator writes 3 thoughtful comments for any post text you paste in. Comments now match your voice samples (the voice block is injected on every call). URL-only input is rejected with a clear error — Cadence can't fetch LinkedIn URLs. |
+| **Voice** | Library of your past posts. Claude samples 3 at random for every generation, so the AI writes in *your* rhythm, not generic AI prose. |
 | **Settings** | API key, creator profile, pillars (with target % and color), backup/restore. |
 
 ---
@@ -135,9 +136,15 @@ drafts by body-snippet similarity first, falling back to date proximity.
 
 - **Backend**: Flask + SQLite, single file (`app.py`)
 - **AI**: Anthropic SDK with Claude Sonnet 4.5 by default (override with
-  `CLAUDE_MODEL` env var)
+  `CLAUDE_MODEL` env var). Prompt caching marks the static system block
+  (`SYSTEM_BASE` + creator profile + voice samples + role instructions)
+  as `cache_control: ephemeral` on every AI call that benefits from it
+  (brain reflection, topic-to-idea, comment generator).
+- **Dependencies**: `flask`, `anthropic`, `python-dotenv`, `openpyxl`,
+  `feedparser`. Pure Python, no native code, no build step.
 - **Frontend**: Vanilla JS, no build step
-- **Tests**: `pytest` smoke suite, runs in CI on Python 3.10 / 3.11 / 3.12
+- **Tests**: `pytest` suite (59 tests across smoke, brain, topics,
+  autodiscovery, engagement), runs in CI on Python 3.10 / 3.11 / 3.12
 
 All AI prompts live in `app.py` so you can tune them. The `SYSTEM_BASE`
 constant defines the writing rules (no em-dashes, banned filler words, etc.)
@@ -147,9 +154,23 @@ and is combined with your live voice samples on every call.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for what's shipped, what's planned (semantic
-memory, daily reflection, topic search, reusable Claude skills), and what's
-deliberately out of scope.
+See [ROADMAP.md](ROADMAP.md) for the full status.
+
+**Recently shipped:**
+- Weekly brain reflection with `cache_control: ephemeral` on the static
+  system prompt and a one-button Dashboard card.
+- RSS / Atom topic intake with HTML feed autodiscovery (paste a blog URL,
+  Cadence finds the feed for you).
+- Comment generator now injects voice samples on every call and rejects
+  URL-only input with an actionable error.
+
+**Still planned:**
+- Semantic memory via embeddings (so discarded patterns dedupe by meaning,
+  not exact wording).
+- Anthropic `web_search_20250305` integration alongside RSS for on-demand
+  topic research.
+- Reusable Claude skills package (`linkedin-hook`, `linkedin-rewrite`,
+  `linkedin-score`, etc.) shippable separately from the Flask app.
 
 ## Contributing
 
