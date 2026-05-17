@@ -202,6 +202,32 @@ The CLI backend (`claude` binary) doesn't support prompt caching; the
 `_system_blocks_to_str` helper flattens the structured system prompt back to
 a string before invoking the CLI. Cache savings apply only on API mode.
 
+## Topic intake loop (RSS / Atom)
+
+Built so the user doesn't have to be the only source of ideas. Configured
+feeds (HN, dev.to, vendor blogs) are fetched on demand by `fetch_topics()`,
+URL-deduped, and inserted into the `topics` table. Each topic has a "Draft
+an angle" button → `POST /api/topics/{id}/draft` → Claude reads the
+topic + pillars + voice and writes an angled idea into the `ideas` table
+tagged `source='topic-intake'`. The topic row is then marked `status='used'`
+with a link back to the idea.
+
+Safety knobs in `app.py`:
+- `TOPIC_FETCH_TIMEOUT_SEC = 10` — per-source HTTP timeout.
+- `TOPIC_FETCH_MAX_BYTES = 2 * 1024 * 1024` — hard byte cap per response.
+- `TOPIC_FETCH_MAX_ITEMS_PER_SOURCE = 30` — don't drown the table.
+- Per-source try/except: one dead feed never aborts the batch.
+
+`_http_get_bounded()` and `_parse_feed_entries()` are the seams to
+monkeypatch in tests — never hit real network from CI. See
+`tests/test_topics.py` for the canned-RSS pattern.
+
+Adding new feed kinds (e.g. JSON Feed, Anthropic web search):
+- New `kind` value on `topic_sources` (no migration needed, just a string).
+- A parser function alongside `_parse_feed_entries` that returns the same
+  `{external_id, url, title, summary, published_at}` dict shape.
+- Dispatch in `fetch_topics()` based on `src["kind"]`.
+
 ## Memory feedback loop (the killer feature)
 
 Three context blocks injected into AI prompts:
@@ -244,6 +270,11 @@ Defined in `SCHEMA` constant in `app.py`. Tables:
 - `reflections` — weekly brain loop output. window_days, summary,
   signals_json (best/weakest pillar, best format, topics), ideas_created_json
   (list of idea ids dropped into the pipeline by that reflection).
+- `topic_sources` — RSS / Atom feed configs: name, url (UNIQUE), kind,
+  enabled, last_fetched_at, last_status.
+- `topics` — ingested headlines: source_id, external_id, url (UNIQUE),
+  title, summary, published_at, status (new / queued / used / dismissed),
+  pillar_id (auto-tagged on draft), idea_id (link back when used).
 
 ### Migrations (added in Phase 1)
 
@@ -508,6 +539,13 @@ POST /api/onboarding/complete       # write profile + seed voice samples in one 
 
 POST /api/brain/reflect             # weekly reflection: summary + 3 auto-ideas (body: {window_days})
 GET  /api/brain/reflections         # list past reflections (?limit=10)
+
+GET/POST          /api/topics/sources       # CRUD on RSS / Atom feed configs
+PUT/DELETE        /api/topics/sources/{id}
+POST              /api/topics/fetch         # pull all enabled (or {source_ids: [...]}), dedup by URL
+GET               /api/topics               # list (?status=, ?source_id=, ?limit=)
+PUT/DELETE        /api/topics/{id}          # status change / remove
+POST              /api/topics/{id}/draft    # Claude turns the topic into an angled idea
 
 GET  /api/backup/export             # download full DB as JSON (?redact=0 keeps API key)
 POST /api/backup/import             # body {payload, mode: 'replace'|'merge'}

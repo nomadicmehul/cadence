@@ -12,6 +12,8 @@ const state = {
   voice: [],
   engagement: [],
   analytics: [],
+  topics: [],
+  topicSources: [],
   selectedDraftId: null,
   calendarCursor: new Date(),
 };
@@ -103,6 +105,7 @@ function switchTab(tab) {
   $$("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
   if (tab === "dashboard") loadDashboard();
+  if (tab === "topics") loadTopics();
   if (tab === "ideas") loadIdeas();
   if (tab === "drafts") loadDrafts();
   if (tab === "calendar") renderCalendar();
@@ -310,6 +313,231 @@ async function loadPillars() {
   const ipf = $("#idea-pillar-filter");
   ipf.innerHTML = `<option value="">All pillars</option>` + opts;
 }
+
+// =====================================================================
+// TOPICS (RSS intake)
+// =====================================================================
+async function loadTopics() {
+  await loadPillars();
+  await loadTopicSources();
+  renderTopicSources();
+  populateTopicSourceFilter();
+  await refreshTopicsList();
+}
+
+async function loadTopicSources() {
+  state.topicSources = await api("/api/topics/sources");
+}
+
+function populateTopicSourceFilter() {
+  const sel = $("#topic-source-filter");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = `<option value="">All sources</option>` +
+    state.topicSources.map(s =>
+      `<option value="${s.id}">${escape(s.name)}</option>`
+    ).join("");
+  sel.value = cur;
+}
+
+function renderTopicSources() {
+  const list = $("#topic-sources-list");
+  if (!list) return;
+  if (!state.topicSources.length) {
+    list.innerHTML = `<div class="muted" style="padding:8px">
+      No sources yet. Click <b>+ Add source</b>.</div>`;
+    return;
+  }
+  list.innerHTML = state.topicSources.map(s => {
+    const lastBadge = s.last_status
+      ? `<span class="muted tiny" title="${escape(s.last_fetched_at || '')}">${escape(s.last_status)}</span>`
+      : "";
+    return `
+      <div class="src-row" data-id="${s.id}">
+        <label class="toggle">
+          <input type="checkbox" data-act="toggle" ${s.enabled ? "checked" : ""} />
+          <span>${escape(s.name)}</span>
+        </label>
+        <code class="muted tiny" style="flex:1;overflow:hidden;text-overflow:ellipsis">${escape(s.url)}</code>
+        ${lastBadge}
+        <button class="btn sm" data-act="edit">Edit</button>
+        <button class="btn sm danger" data-act="delete">×</button>
+      </div>`;
+  }).join("");
+}
+
+$("#topic-sources-list")?.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-act]");
+  if (!btn) return;
+  const row = btn.closest(".src-row");
+  const id = +row.dataset.id;
+  const src = state.topicSources.find(s => s.id === id);
+  if (!src) return;
+  const act = btn.dataset.act;
+  if (act === "toggle") {
+    await api(`/api/topics/sources/${id}`, {
+      method: "PUT",
+      body: { enabled: btn.checked ? 1 : 0 },
+    });
+    await loadTopicSources();
+    renderTopicSources();
+    return;
+  }
+  if (act === "edit") return openTopicSourceEditor(src);
+  if (act === "delete") {
+    if (!confirm(`Remove source "${src.name}"? Existing topics from it are kept.`)) return;
+    await api(`/api/topics/sources/${id}`, { method: "DELETE" });
+    await loadTopicSources();
+    renderTopicSources();
+    populateTopicSourceFilter();
+  }
+});
+
+function openTopicSourceEditor(src) {
+  const isNew = !src;
+  const html = `
+    <label>Name<input id="m-name" value="${escape(src?.name || "")}" /></label>
+    <label>Feed URL<input id="m-url" value="${escape(src?.url || "")}" placeholder="https://example.com/rss" /></label>
+    <label>Kind
+      <select id="m-kind">
+        <option value="rss" ${src?.kind === 'rss' ? 'selected' : ''}>RSS</option>
+        <option value="atom" ${src?.kind === 'atom' ? 'selected' : ''}>Atom</option>
+      </select>
+    </label>
+    <div class="form-row" style="margin-top:14px">
+      <button class="btn primary" id="m-save">${isNew ? "Add source" : "Save"}</button>
+      <button class="btn" id="m-cancel">Cancel</button>
+    </div>`;
+  openModal(isNew ? "Add topic source" : "Edit topic source", html);
+  $("#m-cancel").onclick = closeModal;
+  $("#m-save").onclick = async () => {
+    const body = {
+      name: $("#m-name").value.trim(),
+      url: $("#m-url").value.trim(),
+      kind: $("#m-kind").value,
+    };
+    if (!body.name || !body.url) return toast("Name and URL required", "error");
+    try {
+      if (isNew) await api("/api/topics/sources", { method: "POST", body });
+      else await api(`/api/topics/sources/${src.id}`, { method: "PUT", body });
+    } catch (e) {
+      return toast("Save failed: " + e.message, "error");
+    }
+    closeModal();
+    await loadTopicSources();
+    renderTopicSources();
+    populateTopicSourceFilter();
+  };
+}
+
+async function refreshTopicsList() {
+  const status = $("#topic-status-filter").value;
+  const sourceId = $("#topic-source-filter").value;
+  const params = new URLSearchParams();
+  if (status) params.set("status", status);
+  if (sourceId) params.set("source_id", sourceId);
+  state.topics = await api("/api/topics" + (params.toString() ? "?" + params : ""));
+  renderTopicsList();
+}
+
+function renderTopicsList() {
+  const list = $("#topics-list");
+  if (!list) return;
+  if (!state.topics.length) {
+    list.innerHTML = `<div class="muted" style="grid-column:1/-1;padding:30px;text-align:center">
+      No topics here. Hit <b>Fetch now</b> to pull from your sources.</div>`;
+    return;
+  }
+  list.innerHTML = state.topics.map(t => {
+    const summary = truncate(t.summary || "", 280);
+    const when = t.published_at || t.ingested_at;
+    const sourceTag = t.source_name
+      ? `<span class="muted tiny">${escape(t.source_name)}</span>` : "";
+    const pillarTag = t.pillar_name
+      ? `<span class="pillar-tag"><span class="swatch" style="background:${t.pillar_color || '#666'}"></span>${escape(t.pillar_name)}</span>`
+      : "";
+    const statusChip = `<span class="status-chip ${t.status}">${t.status}</span>`;
+    const linkBtn = t.url
+      ? `<a class="btn sm ghost" href="${escape(t.url)}" target="_blank" rel="noopener">Open ↗</a>` : "";
+    const isUsable = t.status === "new" || t.status === "queued";
+    const draftBtn = isUsable
+      ? `<button class="btn primary sm" data-act="draft" data-id="${t.id}">Draft an angle</button>` : "";
+    const dismissBtn = isUsable
+      ? `<button class="btn sm" data-act="dismiss" data-id="${t.id}">Dismiss</button>` : "";
+    const restoreBtn = (t.status === "dismissed" || t.status === "used")
+      ? `<button class="btn sm" data-act="restore" data-id="${t.id}">Restore</button>` : "";
+    return `
+      <div class="idea topic" data-id="${t.id}">
+        <div class="pillar-tag">
+          ${sourceTag}
+          ${pillarTag}
+          <span style="margin-left:auto">${statusChip}</span>
+        </div>
+        <div class="title">${escape(t.title)}</div>
+        ${summary ? `<div class="angle">${escape(summary)}</div>` : ""}
+        <div class="muted tiny">${fmtDateTime(when)}</div>
+        <div class="actions">
+          ${draftBtn}
+          ${linkBtn}
+          ${dismissBtn}
+          ${restoreBtn}
+        </div>
+      </div>`;
+  }).join("");
+}
+
+$("#topics-list")?.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const id = +btn.dataset.id;
+  const act = btn.dataset.act;
+  if (act === "dismiss") {
+    await api(`/api/topics/${id}`, { method: "PUT", body: { status: "dismissed" } });
+    return refreshTopicsList();
+  }
+  if (act === "restore") {
+    await api(`/api/topics/${id}`, { method: "PUT", body: { status: "new" } });
+    return refreshTopicsList();
+  }
+  if (act === "draft") {
+    return withSpinner(btn, async () => {
+      toast("Asking Claude for an angle…", "");
+      try {
+        const r = await api(`/api/topics/${id}/draft`, { method: "POST", body: {} });
+        if (!r.ok) throw new Error(r.error);
+        toast("Idea added to Ideas Bank", "ok");
+        await refreshTopicsList();
+      } catch (e) {
+        toast("Draft failed: " + e.message, "error");
+      }
+    })();
+  }
+});
+
+$("#topic-status-filter")?.addEventListener("change", refreshTopicsList);
+$("#topic-source-filter")?.addEventListener("change", refreshTopicsList);
+$("#topics-add-source")?.addEventListener("click", () => openTopicSourceEditor(null));
+$("#topics-fetch")?.addEventListener("click", async () => {
+  const btn = $("#topics-fetch");
+  await withSpinner(btn, async () => {
+    toast("Fetching feeds…", "");
+    try {
+      const r = await api("/api/topics/fetch", { method: "POST", body: {} });
+      if (!r.ok) throw new Error(r.error);
+      const errors = (r.per_source || []).filter(s => s.error);
+      if (errors.length) {
+        toast(`Fetched ${r.inserted_total} new · ${errors.length} source(s) failed`, "error");
+      } else {
+        toast(`Fetched ${r.inserted_total} new from ${r.sources_checked} source(s)`, "ok");
+      }
+      await loadTopicSources();
+      renderTopicSources();
+      await refreshTopicsList();
+    } catch (e) {
+      toast("Fetch failed: " + e.message, "error");
+    }
+  })();
+});
 
 // =====================================================================
 // IDEAS
