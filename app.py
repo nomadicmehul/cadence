@@ -143,6 +143,31 @@ CREATE TABLE IF NOT EXISTS reflections (
     signals_json TEXT,
     ideas_created_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS topic_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,
+    kind TEXT DEFAULT 'rss',  -- rss | atom | web_search (future)
+    enabled INTEGER DEFAULT 1,
+    last_fetched_at TEXT,
+    last_status TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER REFERENCES topic_sources(id) ON DELETE CASCADE,
+    external_id TEXT,
+    url TEXT UNIQUE,
+    title TEXT NOT NULL,
+    summary TEXT,
+    published_at TEXT,
+    ingested_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    status TEXT DEFAULT 'new',  -- new | queued | used | dismissed
+    pillar_id INTEGER REFERENCES pillars(id) ON DELETE SET NULL,
+    idea_id INTEGER REFERENCES ideas(id) ON DELETE SET NULL
+);
 """
 
 
@@ -181,7 +206,7 @@ def db_cursor():
 # run their SQL, and must be idempotent (safe to re-run if interrupted).
 # ---------------------------------------------------------------------------
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def _migration_v1(conn: sqlite3.Connection) -> None:
@@ -208,9 +233,43 @@ def _migration_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v3(conn: sqlite3.Connection) -> None:
+    """Add topic_sources and topics tables for the RSS intake loop.
+
+    Same pattern as v2: SCHEMA creates them via IF NOT EXISTS; this records
+    the version. Kept explicit so ALTER-style migrations have a home later.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS topic_sources ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "name TEXT NOT NULL, "
+        "url TEXT NOT NULL UNIQUE, "
+        "kind TEXT DEFAULT 'rss', "
+        "enabled INTEGER DEFAULT 1, "
+        "last_fetched_at TEXT, "
+        "last_status TEXT, "
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS topics ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "source_id INTEGER REFERENCES topic_sources(id) ON DELETE CASCADE, "
+        "external_id TEXT, "
+        "url TEXT UNIQUE, "
+        "title TEXT NOT NULL, "
+        "summary TEXT, "
+        "published_at TEXT, "
+        "ingested_at TEXT DEFAULT CURRENT_TIMESTAMP, "
+        "status TEXT DEFAULT 'new', "
+        "pillar_id INTEGER REFERENCES pillars(id) ON DELETE SET NULL, "
+        "idea_id INTEGER REFERENCES ideas(id) ON DELETE SET NULL)"
+    )
+
+
 MIGRATIONS: list[tuple[int, Any]] = [
     (1, _migration_v1),
     (2, _migration_v2),
+    (3, _migration_v3),
 ]
 
 
@@ -253,6 +312,12 @@ def init_db():
                 conn.execute(
                     "INSERT INTO settings(key, value) VALUES (?, ?)", (k, v)
                 )
+        cur = conn.execute("SELECT COUNT(*) AS n FROM topic_sources")
+        if cur.fetchone()["n"] == 0:
+            conn.executemany(
+                "INSERT INTO topic_sources(name, url, kind) VALUES (?, ?, ?)",
+                DEFAULT_TOPIC_SOURCES,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +370,15 @@ DEFAULT_SETTINGS = {
     "weekly_target": "5",
     "preferred_hours": "09:00,12:30,17:30",
 }
+
+# Default RSS feeds seeded on first run. Generic on purpose — the user adds,
+# removes, or disables any of these from the Topics tab. Kept short so first
+# fetch isn't slow. Order matters: newest-friendly feeds first.
+DEFAULT_TOPIC_SOURCES = [
+    ("Hacker News (front page)", "https://hnrss.org/frontpage", "rss"),
+    ("dev.to (top)", "https://dev.to/feed/top/week", "rss"),
+    ("Anthropic news", "https://www.anthropic.com/news/rss.xml", "rss"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +848,7 @@ def _row_count(table: str) -> int:
 EXPORT_TABLES = (
     "settings", "pillars", "ideas", "drafts", "analytics",
     "voice_samples", "engagement_tasks", "reflections",
+    "topic_sources", "topics",
 )
 
 
@@ -811,9 +886,9 @@ def import_from_dict(payload: dict, *, mode: str = "replace") -> dict:
     with db_cursor() as conn:
         if mode == "replace":
             # Order matters because of FK refs; child tables first.
-            for tbl in ("analytics", "engagement_tasks", "drafts",
-                        "ideas", "voice_samples", "pillars", "settings",
-                        "reflections"):
+            for tbl in ("analytics", "engagement_tasks", "topics",
+                        "topic_sources", "drafts", "ideas", "voice_samples",
+                        "pillars", "settings", "reflections"):
                 conn.execute(f"DELETE FROM {tbl}")
         for tbl in EXPORT_TABLES:
             rows = tables.get(tbl) or []
@@ -1614,6 +1689,384 @@ def api_drafts_score(did):
         return jsonify({"ok": True, **data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Routes — topics (RSS / Atom intake)
+#
+# The "what should I post about?" feed. Pulls headlines from user-configured
+# sources (HN, dev.to, vendor blogs), dedups by URL, and lets the user turn
+# any topic into an angled idea via Claude. Triggered manually from the
+# Topics tab — no in-process cron, mirroring the brain-loop philosophy.
+# ---------------------------------------------------------------------------
+
+TOPIC_FETCH_TIMEOUT_SEC = 10
+TOPIC_FETCH_MAX_BYTES = 2 * 1024 * 1024  # 2 MB per feed; LinkedIn-sized
+TOPIC_FETCH_MAX_ITEMS_PER_SOURCE = 30  # don't drown the table on first fetch
+TOPIC_USER_AGENT = "Cadence/1.0 (+https://github.com/nomadicmehul/cadence)"
+
+
+def _http_get_bounded(url: str, *, timeout: int, max_bytes: int) -> bytes:
+    """Plain urllib GET with a hard byte ceiling. No redirects-handling magic
+    beyond urllib's default (which handles up to ~10 hops automatically)."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": TOPIC_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # iter_content equivalent: cap bytes ourselves so a hostile feed can't
+        # OOM the process.
+        data = bytearray()
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ValueError(
+                    f"Response exceeded {max_bytes} bytes; aborted"
+                )
+        return bytes(data)
+
+
+def _parse_feed_entries(raw: bytes) -> list[dict]:
+    """Run feedparser on raw bytes; normalise the bits we actually care about."""
+    try:
+        import feedparser
+    except ImportError:
+        raise RuntimeError("feedparser not installed. Run: pip install feedparser")
+    parsed = feedparser.parse(raw)
+    out: list[dict] = []
+    for entry in parsed.entries[:TOPIC_FETCH_MAX_ITEMS_PER_SOURCE]:
+        link = (entry.get("link") or "").strip()
+        title = (entry.get("title") or "").strip()
+        if not link or not title:
+            continue
+        summary = (
+            entry.get("summary") or entry.get("description") or ""
+        ).strip()
+        # feedparser parses dates into struct_time on `published_parsed`.
+        published_iso = ""
+        pp = entry.get("published_parsed") or entry.get("updated_parsed")
+        if pp:
+            try:
+                published_iso = datetime(*pp[:6]).isoformat(timespec="seconds")
+            except (TypeError, ValueError):
+                published_iso = ""
+        out.append({
+            "external_id": (entry.get("id") or link)[:300],
+            "url": link[:1000],
+            "title": title[:500],
+            "summary": summary[:2000],
+            "published_at": published_iso,
+        })
+    return out
+
+
+def fetch_topics(*, source_ids: list[int] | None = None) -> dict:
+    """Pull from every enabled source (or a subset by id), dedup by URL,
+    insert new rows. Per-source failures don't abort the batch."""
+    with db_cursor() as conn:
+        if source_ids:
+            qmarks = ",".join("?" for _ in source_ids)
+            sources = conn.execute(
+                f"SELECT * FROM topic_sources WHERE id IN ({qmarks}) "
+                "AND enabled=1",
+                tuple(source_ids),
+            ).fetchall()
+        else:
+            sources = conn.execute(
+                "SELECT * FROM topic_sources WHERE enabled=1"
+            ).fetchall()
+
+    per_source: list[dict] = []
+    inserted_total = 0
+    for src in sources:
+        result = {
+            "source_id": src["id"], "source_name": src["name"],
+            "inserted": 0, "skipped_existing": 0, "error": None,
+        }
+        try:
+            raw = _http_get_bounded(
+                src["url"],
+                timeout=TOPIC_FETCH_TIMEOUT_SEC,
+                max_bytes=TOPIC_FETCH_MAX_BYTES,
+            )
+            entries = _parse_feed_entries(raw)
+        except Exception as e:
+            result["error"] = str(e)[:200]
+            with db_cursor() as conn:
+                conn.execute(
+                    "UPDATE topic_sources SET last_fetched_at=?, last_status=? "
+                    "WHERE id=?",
+                    (datetime.utcnow().isoformat(timespec="seconds"),
+                     f"error: {result['error']}", src["id"]),
+                )
+            per_source.append(result)
+            continue
+
+        with db_cursor() as conn:
+            for e in entries:
+                # UNIQUE on url means duplicate inserts raise; count and skip.
+                try:
+                    conn.execute(
+                        "INSERT INTO topics(source_id, external_id, url, "
+                        "title, summary, published_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (src["id"], e["external_id"], e["url"], e["title"],
+                         e["summary"], e["published_at"]),
+                    )
+                    result["inserted"] += 1
+                except sqlite3.IntegrityError:
+                    result["skipped_existing"] += 1
+            conn.execute(
+                "UPDATE topic_sources SET last_fetched_at=?, last_status=? "
+                "WHERE id=?",
+                (datetime.utcnow().isoformat(timespec="seconds"),
+                 f"ok: {result['inserted']} new", src["id"]),
+            )
+        inserted_total += result["inserted"]
+        per_source.append(result)
+
+    return {
+        "inserted_total": inserted_total,
+        "sources_checked": len(sources),
+        "per_source": per_source,
+    }
+
+
+@app.get("/api/topics/sources")
+def api_topic_sources_list():
+    with db_cursor() as conn:
+        rows = conn.execute(
+            "SELECT * FROM topic_sources ORDER BY id"
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/topics/sources")
+def api_topic_sources_create():
+    p = request.get_json(force=True)
+    name = (p.get("name") or "").strip()
+    url = (p.get("url") or "").strip()
+    if not name or not url:
+        return jsonify({"error": "name and url are required"}), 400
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return jsonify({"error": "url must be http(s)"}), 400
+    try:
+        with db_cursor() as conn:
+            cur = conn.execute(
+                "INSERT INTO topic_sources(name, url, kind, enabled) "
+                "VALUES (?, ?, ?, ?)",
+                (name, url, p.get("kind", "rss"),
+                 1 if p.get("enabled", True) else 0),
+            )
+        return jsonify({"id": cur.lastrowid})
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "that url is already a source"}), 409
+
+
+@app.put("/api/topics/sources/<int:sid>")
+def api_topic_sources_update(sid):
+    p = request.get_json(force=True)
+    fields = ["name", "url", "kind", "enabled"]
+    sets = ", ".join(f"{f}=?" for f in fields if f in p)
+    values = [p[f] for f in fields if f in p]
+    if not sets:
+        return jsonify({"ok": True})
+    try:
+        with db_cursor() as conn:
+            conn.execute(
+                f"UPDATE topic_sources SET {sets} WHERE id=?",
+                (*values, sid),
+            )
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "that url is already a source"}), 409
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/topics/sources/<int:sid>")
+def api_topic_sources_delete(sid):
+    with db_cursor() as conn:
+        conn.execute("DELETE FROM topic_sources WHERE id=?", (sid,))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/topics/fetch")
+def api_topics_fetch():
+    p = request.get_json(silent=True) or {}
+    source_ids = p.get("source_ids") or None
+    if source_ids is not None:
+        try:
+            source_ids = [int(s) for s in source_ids]
+        except (TypeError, ValueError):
+            return jsonify({"error": "source_ids must be a list of ints"}), 400
+    try:
+        result = fetch_topics(source_ids=source_ids)
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/topics")
+def api_topics_list():
+    status = request.args.get("status")
+    source_id = request.args.get("source_id")
+    limit = request.args.get("limit", "100")
+    try:
+        limit = max(1, min(int(limit), 500))
+    except ValueError:
+        limit = 100
+    sql = (
+        "SELECT t.*, s.name as source_name, p.name as pillar_name, "
+        "p.color as pillar_color "
+        "FROM topics t LEFT JOIN topic_sources s ON s.id = t.source_id "
+        "LEFT JOIN pillars p ON p.id = t.pillar_id WHERE 1=1"
+    )
+    params: list = []
+    if status:
+        sql += " AND t.status=?"
+        params.append(status)
+    if source_id:
+        try:
+            params.append(int(source_id))
+            sql += " AND t.source_id=?"
+        except ValueError:
+            pass
+    sql += " ORDER BY COALESCE(t.published_at, t.ingested_at) DESC LIMIT ?"
+    params.append(limit)
+    with db_cursor() as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.put("/api/topics/<int:tid>")
+def api_topics_update(tid):
+    p = request.get_json(force=True)
+    fields = ["status", "pillar_id"]
+    sets = ", ".join(f"{f}=?" for f in fields if f in p)
+    values = [p[f] for f in fields if f in p]
+    if not sets:
+        return jsonify({"ok": True})
+    with db_cursor() as conn:
+        conn.execute(
+            f"UPDATE topics SET {sets} WHERE id=?", (*values, tid)
+        )
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/topics/<int:tid>")
+def api_topics_delete(tid):
+    with db_cursor() as conn:
+        conn.execute("DELETE FROM topics WHERE id=?", (tid,))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/topics/<int:tid>/draft")
+def api_topics_draft(tid):
+    """Turn a topic into an angled idea. Calls Claude with the creator's
+    voice + pillars so the resulting idea isn't a generic 'react to news'."""
+    p = request.get_json(silent=True) or {}
+    pillar_id = p.get("pillar_id")
+    with db_cursor() as conn:
+        topic = conn.execute(
+            "SELECT t.*, s.name as source_name FROM topics t "
+            "LEFT JOIN topic_sources s ON s.id = t.source_id "
+            "WHERE t.id=?",
+            (tid,),
+        ).fetchone()
+        if not topic:
+            return jsonify({"ok": False, "error": "Topic not found"}), 404
+        pillars = conn.execute(
+            "SELECT id, name, description FROM pillars ORDER BY sort_order"
+        ).fetchall()
+
+    pillar_lines = "\n".join(
+        f"- {pr['name']}: {pr['description']}" for pr in pillars
+    ) or "(no pillars defined yet)"
+
+    static_system = (
+        SYSTEM_BASE + "\n\n" + creator_block() + voice_block()
+        + "\n\nYou are now generating ONE post idea inspired by an external "
+          "topic. The idea must reflect the creator's voice and pillars, not "
+          "merely summarise the source. Aim for a personal angle, lesson, or "
+          "contrarian take."
+    )
+    system = [
+        {"type": "text", "text": static_system,
+         "cache_control": {"type": "ephemeral"}},
+    ]
+
+    user = textwrap.dedent(f"""
+        EXTERNAL TOPIC:
+        Source: {topic['source_name'] or '(unknown)'}
+        Title: {topic['title']}
+        URL: {topic['url'] or ''}
+        Summary: {topic['summary'] or ''}
+
+        ACTIVE PILLARS:
+        {pillar_lines}
+
+        Return ONLY valid JSON in this exact shape:
+        {{
+          "title": "6-10 word working title for the post",
+          "hook": "the actual first line of the post (must stop the scroll)",
+          "angle": "1-2 sentences on the unique POV / story / data point this creator brings",
+          "format": "story|list|contrarian|tutorial|bts",
+          "pillar": "name from the active pillars above, or null"
+        }}
+    """).strip()
+
+    try:
+        text = call_claude(system, user, json_mode=True, max_tokens=600)
+        data = json.loads(text)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # Map pillar by case-insensitive name unless caller overrode
+    pillar_match = None
+    if pillar_id:
+        try:
+            pillar_match = int(pillar_id)
+        except (TypeError, ValueError):
+            pillar_match = None
+    if pillar_match is None:
+        name = (data.get("pillar") or "").strip().lower()
+        for pr in pillars:
+            if pr["name"].lower() == name:
+                pillar_match = pr["id"]
+                break
+
+    fmt = data.get("format") or "story"
+    angle_with_format = (data.get("angle") or "") + f"\n\n[format: {fmt}]"
+    angle_with_source = (
+        angle_with_format + f"\n\nSource: {topic['url'] or topic['source_name']}"
+    )
+
+    with db_cursor() as conn:
+        cur = conn.execute(
+            "INSERT INTO ideas(pillar_id, title, hook, angle, source) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                pillar_match,
+                (data.get("title") or topic["title"])[:200],
+                data.get("hook", ""),
+                angle_with_source,
+                "topic-intake",
+            ),
+        )
+        idea_id = cur.lastrowid
+        conn.execute(
+            "UPDATE topics SET status='used', idea_id=?, pillar_id=? "
+            "WHERE id=?",
+            (idea_id, pillar_match, tid),
+        )
+
+    return jsonify({
+        "ok": True,
+        "idea_id": idea_id,
+        "topic_id": tid,
+        "pillar_id": pillar_match,
+        "data": data,
+    })
 
 
 # ---------------------------------------------------------------------------

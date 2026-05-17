@@ -18,6 +18,7 @@
   </div>
   <nav class="tabs" id="tabs">
     <button data-tab="dashboard" class="active">Dashboard</button>
+    <button data-tab="topics">Topics</button>
     <button data-tab="ideas">Ideas</button>
     <button data-tab="drafts">Drafts</button>
     <button data-tab="calendar">Calendar</button>
@@ -96,6 +97,37 @@
         <div id="memory-snapshot"></div>
       </div>
     </div>
+  </section>
+
+  <!-- TOPICS -------------------------------------------------------------->
+  <section class="view" id="view-topics">
+    <div class="view-head">
+      <h2>Topics</h2>
+      <p class="muted" style="margin:4px 0 0 0">
+        Fresh angles from outside your bubble. Pull headlines from RSS feeds,
+        then turn any topic into an angled idea in one click.
+      </p>
+      <div class="head-actions">
+        <select id="topic-status-filter">
+          <option value="new" selected>New</option>
+          <option value="">All</option>
+          <option value="queued">Queued</option>
+          <option value="used">Used</option>
+          <option value="dismissed">Dismissed</option>
+        </select>
+        <select id="topic-source-filter"><option value="">All sources</option></select>
+        <button class="btn primary" id="topics-fetch">Fetch now</button>
+        <button class="btn" id="topics-add-source">+ Add source</button>
+      </div>
+    </div>
+    <div class="card" id="topic-sources-card">
+      <div class="card-head">
+        <h3>Sources</h3>
+        <span class="muted tiny">Toggle, edit, or remove. The fetcher hits enabled sources only.</span>
+      </div>
+      <div id="topic-sources-list"></div>
+    </div>
+    <div id="topics-list" class="grid"></div>
   </section>
 
   <!-- IDEAS --------------------------------------------------------------->
