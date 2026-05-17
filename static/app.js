@@ -1192,15 +1192,19 @@ function renderSheetPicker(r) {
 
 function renderImportPreview(r, meta = {}) {
   const preview = $("#dz-preview");
-  const draftOpts = (selectedId) => `
-    <option value="">— skip —</option>
+  const matched = r.parsed.filter(p => p.matched_draft_id).length;
+  const total = r.parsed.length;
+  // Smart default: if 0 rows auto-matched (historical bulk import — the
+  // user has no in-Cadence drafts to match against), every dropdown
+  // defaults to "+ Create new draft" so they don't have to flip 46 of them.
+  const defaultCreate = matched === 0 && total > 0;
+  const draftOpts = (selectedId, useCreateDefault) => `
+    <option value="" ${!selectedId && !useCreateDefault ? "selected" : ""}>— skip —</option>
+    <option value="__new__" ${useCreateDefault ? "selected" : ""}>+ Create new draft</option>
     ${r.drafts.map(d =>
       `<option value="${d.id}" ${d.id === selectedId ? "selected" : ""}>
         #${d.id} · ${escape(d.title || d.preview || "Untitled").slice(0, 50)}
       </option>`).join("")}`;
-
-  const matched = r.parsed.filter(p => p.matched_draft_id).length;
-  const total = r.parsed.length;
 
   let sheetInfo = "";
   if (r.sheet_used) {
@@ -1216,12 +1220,40 @@ function renderImportPreview(r, meta = {}) {
     </div>`;
   }
 
+  // Backend notes (subtable merge, engagement-aggregate fallback) surface
+  // as a small warning card so the user understands what we did to their
+  // data before they hit Import.
+  const notes = Array.isArray(r.notes) ? r.notes : [];
+  const notesBlock = notes.length
+    ? `<div class="card" style="margin:8px 0;padding:10px;border-color:#b45309">
+         ${notes.map(n => `<div class="muted tiny" style="color:#fbbf24">⚠ ${escape(n)}</div>`).join("")}
+       </div>`
+    : "";
+
+  const historicalHint = defaultCreate
+    ? `<div class="muted tiny" style="margin:6px 0">
+         No matching drafts in Cadence yet. Every row is set to
+         <b>+ Create new draft</b> by default so your history populates
+         in one click. Switch to <b>— skip —</b> for any row you don't want.
+       </div>`
+    : "";
+
   preview.innerHTML = `
     ${sheetInfo}
+    ${notesBlock}
     <div class="import-summary">
       <div><b>${total}</b> rows · <b>${matched}</b> auto-matched · ${total - matched} need review</div>
-      <button class="btn primary" id="import-confirm">Import ${total} rows</button>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <span class="muted tiny">Set all to:</span>
+        <select id="bulk-match" style="padding:4px 8px;font-size:12px;width:auto">
+          <option value="">choose…</option>
+          <option value="__new__">+ Create new draft</option>
+          <option value="">— skip —</option>
+        </select>
+        <button class="btn primary" id="import-confirm">Import ${total} rows</button>
+      </div>
     </div>
+    ${historicalHint}
     <div style="max-height:50vh;overflow:auto;border:1px solid var(--line);border-radius:8px">
       <table class="import-table">
         <thead><tr>
@@ -1241,7 +1273,7 @@ function renderImportPreview(r, meta = {}) {
               <td class="num">${p.reposts||0}</td>
               <td>
                 <select data-match="${p.row_idx}">
-                  ${draftOpts(p.matched_draft_id)}
+                  ${draftOpts(p.matched_draft_id, defaultCreate && !p.matched_draft_id)}
                 </select>
                 ${p.match_reason ? `<div class="muted tiny">via ${escape(p.match_reason)}</div>` : ""}
               </td>
@@ -1256,19 +1288,52 @@ function renderImportPreview(r, meta = {}) {
     switchSel.addEventListener("change", e => runImportPreview(e.target.value));
   }
 
+  // Bulk "set all to..." action: applies to every row's match dropdown.
+  // Lets the user override the smart default or batch-flip the rest.
+  const bulkSel = $("#bulk-match");
+  if (bulkSel) {
+    bulkSel.addEventListener("change", e => {
+      const v = e.target.value;
+      preview.querySelectorAll("select[data-match]").forEach(s => {
+        s.value = v;
+      });
+      // Reset the bulk picker to "choose…" so re-selecting the same value
+      // fires the change event next time.
+      setTimeout(() => { bulkSel.value = ""; }, 100);
+    });
+  }
+
   // Confirm handler
   $("#import-confirm").addEventListener("click", async () => {
     const rows = r.parsed.map(p => {
       const sel = preview.querySelector(`select[data-match="${p.row_idx}"]`);
-      const did = sel && sel.value ? +sel.value : null;
+      const val = sel ? sel.value : "";
+      // "__new__" is a string sentinel; numeric ids cast to number; "" means skip.
+      const draft_id = val === "__new__" ? "__new__" : (val ? +val : null);
       return {
-        draft_id: did,
+        draft_id,
+        date: p.date,
+        snippet: p.snippet,
+        url: p.url,
         impressions: p.impressions, likes: p.likes,
         comments: p.comments, reposts: p.reposts, follows: p.follows || 0,
       };
-    }).filter(x => x.draft_id);
+    }).filter(x => x.draft_id !== null);
 
     if (!rows.length) return toast("Match at least one row first", "error");
+
+    // Confirm before creating new drafts in bulk — this is the historical
+    // import path and the user should know what's about to happen.
+    const newCount = rows.filter(x => x.draft_id === "__new__").length;
+    if (newCount > 0) {
+      const ok = confirm(
+        newCount + " row" + (newCount === 1 ? "" : "s") + " will create new published drafts in Cadence.\n\n"
+        + "These will have an empty body — LinkedIn's xlsx export doesn't include "
+        + "post text, only URLs and metrics. You can paste body text in later for "
+        + "any post you want to mine for voice training.\n\nContinue?"
+      );
+      if (!ok) return;
+    }
 
     const btn = $("#import-confirm");
     await withSpinner(btn, async () => {
@@ -1276,7 +1341,9 @@ function renderImportPreview(r, meta = {}) {
         method: "POST", body: { rows },
       });
       if (!res.ok) return toast(res.error || "Import failed", "error");
-      toast(`Imported ${res.created} posts. Skipped ${res.skipped}.`, "ok");
+      const newDrafts = (res.new_drafts || []).length;
+      const tail = newDrafts ? " · " + newDrafts + " new draft" + (newDrafts === 1 ? "" : "s") + " created" : "";
+      toast("Imported " + res.created + " posts. Skipped " + res.skipped + "." + tail, "ok");
       closeModal();
       loadAnalytics();
       loadDashboard();
