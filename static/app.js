@@ -1603,33 +1603,34 @@ function renderModelPicker(a) {
     customInput.value = dbVal;
   }
 
-  // Source indicator: tells the user where the active model is coming from.
+  // Source indicator: tells the user where the active model is coming from,
+  // and what would be active on the API backend if they're currently on CLI.
+  // The picker is always enabled — the setting is persistent. If a user is
+  // on CLI today and picks Opus, that takes effect the moment they switch
+  // to an API key.
   const src = $("#model-source");
+  const wouldBeActive = (() => {
+    if (dbVal) return `${dbVal} (from Settings)`;
+    if (envVal) return `${envVal} (from CLAUDE_MODEL env)`;
+    return `${builtin} (built-in default)`;
+  })();
   if (a.provider === "cli") {
-    src.textContent = "n/a (CLI backend)";
+    src.textContent = `${wouldBeActive} · saves but inactive on CLI`;
     src.style.color = "var(--muted)";
-  } else if (dbVal) {
-    src.textContent = `active: ${active} (from Settings)`;
-    src.style.color = "var(--text)";
-  } else if (envVal) {
-    src.textContent = `active: ${active} (from CLAUDE_MODEL env)`;
-    src.style.color = "var(--text)";
   } else {
-    src.textContent = `active: ${active} (built-in default)`;
-    src.style.color = "var(--muted)";
+    src.textContent = `active: ${wouldBeActive}`;
+    src.style.color = "var(--text)";
   }
 
-  // Blurb for the currently-selected known model
+  // Blurb: per-model on known selections, CLI caveat when relevant.
   const blurb = $("#model-blurb");
   const selectedKnown = known.find(m => m.id === sel.value);
-  blurb.textContent = selectedKnown ? selectedKnown.blurb : "";
-
-  // Disable controls on CLI mode — the setting wouldn't take effect.
-  const cliOnly = a.provider === "cli";
-  sel.disabled = cliOnly;
-  customInput.disabled = cliOnly;
-  $("#save-model").disabled = cliOnly;
-  $("#model-row").style.opacity = cliOnly ? "0.6" : "1";
+  if (a.provider === "cli") {
+    blurb.textContent = "Saving still works — the value applies when you switch to an API key. "
+      + "On CLI mode, Claude Code uses whatever model it's configured with.";
+  } else {
+    blurb.textContent = selectedKnown ? selectedKnown.blurb : "";
+  }
 }
 
 $("#set-model")?.addEventListener("change", (e) => {
