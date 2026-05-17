@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Cadence · the local-first content brain for LinkedIn creators</title>
+<meta name="description" content="A self-hosted, single-user LinkedIn growth tool powered by Claude. Turn chaotic posting into a repeatable pipeline: Ideas, Drafts, Scheduled, Published, Analytics, Repurpose. Your data never leaves your laptop." />
+
+<!-- Open Graph -->
+<meta property="og:title" content="Cadence: local-first content brain for LinkedIn" />
+<meta property="og:description" content="Self-hosted Flask + SQLite app powered by Claude. Topic intake, weekly brain reflection, voice-matched drafts, analytics import. Runs on your Mac, your data stays local." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://nomadicmehul.github.io/cadence/" />
+<meta name="twitter:card" content="summary_large_image" />
+
+<!-- Favicon: inline SVG, no binary file -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111827'/%3E%3Ctext x='50%25' y='54%25' text-anchor='middle' font-family='Inter,sans-serif' font-size='30' font-weight='700' fill='%23a78bfa' dominant-baseline='middle'%3Ein%3C/text%3E%3C/svg%3E" />
+
+<style>
+  :root {
+    --bg-1: #0a0b10;
+    --bg-2: #11131b;
+    --bg-3: #181b27;
+    --line: #232636;
+    --line-2: #2f3346;
+    --text: #e7e9f3;
+    --muted: #8b91a8;
+    --accent: #a78bfa;
+    --accent-2: #6366f1;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --r: 14px;
+    --t: cubic-bezier(.4, 0, .2, 1);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(167, 139, 250, .12), transparent 60%),
+      radial-gradient(900px 500px at 0% 0%, rgba(99, 102, 241, .10), transparent 60%),
+      var(--bg-1);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-decoration-color: var(--accent-2); }
+
+  code, pre {
+    font-family: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 13.5px;
+  }
+
+  pre {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    margin: 0;
+  }
+
+  code:not(pre code) {
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 0.92em;
+  }
+
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- Top nav ---------- */
+  header.topbar {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(10, 11, 16, 0.75);
+    backdrop-filter: saturate(180%) blur(14px);
+    -webkit-backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid var(--line);
+  }
+  header.topbar .wrap {
+    display: flex; align-items: center; gap: 18px;
+    padding-top: 14px; padding-bottom: 14px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-mark {
+    width: 36px; height: 36px; border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #0a0b10;
+    display: grid; place-items: center;
+    font-weight: 800; font-size: 16px; letter-spacing: -.02em;
+  }
+  .brand-title { font-weight: 700; letter-spacing: -.01em; }
+  .brand-sub { color: var(--muted); font-size: 12px; }
+  nav.links { margin-left: auto; display: flex; gap: 22px; }
+  nav.links a { color: var(--muted); font-size: 14px; }
+  nav.links a:hover { color: var(--text); text-decoration: none; }
+  .gh-btn {
+    border: 1px solid var(--line);
+    padding: 7px 13px;
+    border-radius: 8px;
+    color: var(--text);
+    background: var(--bg-3);
+    font-size: 13.5px;
+  }
+  .gh-btn:hover { border-color: var(--line-2); text-decoration: none; }
+
+  /* ---------- Hero ---------- */
+  section.hero { padding: 80px 0 60px; }
+  .hero h1 {
+    font-size: 56px; line-height: 1.05; letter-spacing: -.025em;
+    margin: 0 0 18px 0;
+    font-weight: 700;
+  }
+  .hero h1 .grad {
+    background: linear-gradient(110deg, #a78bfa 10%, #6366f1 60%, #34d399 95%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .hero .lede {
+    font-size: 19px;
+    color: var(--muted);
+    max-width: 700px;
+    margin: 0 0 28px 0;
+  }
+  .hero .cta-row { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 18px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--bg-3);
+    color: var(--text);
+    font-weight: 500;
+    font-size: 14.5px;
+    transition: border-color .15s var(--t), transform .15s var(--t);
+  }
+  .btn.primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    border: none;
+    color: #0a0b10;
+    font-weight: 600;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .btn.primary:hover { filter: brightness(1.05); }
+  .btn .arrow { transition: transform .15s var(--t); }
+  .btn:hover .arrow { transform: translateX(2px); }
+
+  /* Pipeline ribbon */
+  .pipeline {
+    margin-top: 56px;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 10px;
+  }
+  .stage {
+    padding: 14px 14px 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    position: relative;
+  }
+  .stage .num { color: var(--muted); font-size: 11px; letter-spacing: .15em; text-transform: uppercase; }
+  .stage .name { font-weight: 600; margin-top: 4px; font-size: 14.5px; }
+  .stage .note { color: var(--muted); font-size: 12.5px; margin-top: 4px; line-height: 1.45; }
+  .stage:nth-child(odd) { border-color: var(--line-2); }
+  .stage::after {
+    content: "→";
+    position: absolute;
+    right: -14px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--accent);
+    font-size: 14px;
+    opacity: .55;
+  }
+  .stage:last-child::after { display: none; }
+
+  @media (max-width: 920px) {
+    .hero h1 { font-size: 40px; }
+    .pipeline { grid-template-columns: 1fr 1fr; }
+    .stage::after { display: none; }
+  }
+  @media (max-width: 540px) {
+    .hero h1 { font-size: 34px; }
+    .pipeline { grid-template-columns: 1fr; }
+  }
+
+  /* ---------- Generic section ---------- */
+  section { padding: 64px 0; }
+  section h2 {
+    font-size: 30px; letter-spacing: -.015em;
+    margin: 0 0 8px 0;
+  }
+  section .kicker {
+    color: var(--accent);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+  }
+  section .sub {
+    color: var(--muted);
+    font-size: 16.5px;
+    margin: 0 0 36px 0;
+    max-width: 740px;
+  }
+
+  /* ---------- Feature grid ---------- */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+  @media (max-width: 920px) {
+    .feature-grid { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 620px) {
+    .feature-grid { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 20px;
+    transition: border-color .15s var(--t), transform .15s var(--t);
+  }
+  .card:hover { border-color: var(--line-2); transform: translateY(-2px); }
+  .card .ico {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: var(--bg-3);
+    display: grid; place-items: center;
+    margin-bottom: 14px;
+    color: var(--accent);
+    border: 1px solid var(--line);
+  }
+  .card h3 { margin: 0 0 6px 0; font-size: 16.5px; }
+  .card p { color: var(--muted); font-size: 14px; margin: 0; line-height: 1.55; }
+
+  /* ---------- Why different ---------- */
+  .compare {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 740px) { .compare { grid-template-columns: 1fr; } }
+  .compare .card { padding: 22px; }
+  .compare .card h3 { font-size: 17px; margin-bottom: 12px; }
+  .compare ul { padding-left: 0; list-style: none; margin: 0; }
+  .compare li { padding: 6px 0 6px 26px; position: relative; color: var(--muted); font-size: 14.5px; }
+  .compare li::before {
+    position: absolute; left: 0; top: 8px;
+    width: 16px; height: 16px;
+    border-radius: 4px;
+    display: grid; place-items: center;
+    font-size: 11px; font-weight: 700;
+  }
+  .compare .yes li::before {
+    content: "✓"; background: rgba(52, 211, 153, .15); color: var(--good);
+  }
+  .compare .no li::before {
+    content: "·"; background: var(--bg-3); color: var(--muted);
+  }
+
+  /* ---------- Install ---------- */
+  .install-row {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    gap: 24px;
+    align-items: center;
+  }
+  @media (max-width: 820px) { .install-row { grid-template-columns: 1fr; } }
+  .install-row .copy h3 { margin: 0 0 8px 0; font-size: 20px; }
+  .install-row .copy p { color: var(--muted); margin: 0 0 12px 0; }
+  .install-row .copy code { color: var(--text); }
+
+  /* ---------- Footer ---------- */
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 30px 0 40px;
+    color: var(--muted);
+    font-size: 13.5px;
+  }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; justify-content: space-between; }
+  footer a { color: var(--muted); }
+  footer a:hover { color: var(--text); text-decoration: none; }
+  footer .foot-links { display: flex; gap: 18px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <a href="#top" class="brand" style="text-decoration:none;color:inherit">
+      <div class="brand-mark">in</div>
+      <div>
+        <div class="brand-title">Cadence</div>
+        <div class="brand-sub">local-first content brain</div>
+      </div>
+    </a>
+    <nav class="links">
+      <a href="#features">Features</a>
+      <a href="#why">Why different</a>
+      <a href="#install">Install</a>
+      <a href="#roadmap">Roadmap</a>
+    </nav>
+    <a class="gh-btn" href="https://github.com/nomadicmehul/cadence" target="_blank" rel="noopener">
+      Star on GitHub ★
+    </a>
+  </div>
+</header>
+
+<a id="top"></a>
+<section class="hero">
+  <div class="wrap">
+    <h1>
+      Stop hand-rolling LinkedIn posts.<br/>
+      <span class="grad">Run them through a pipeline.</span>
+    </h1>
+    <p class="lede">
+      Cadence is a self-hosted, single-user growth tool for LinkedIn creators.
+      Ideas in, polished drafts out, in your voice, on your laptop. Powered by
+      Claude. Your data never leaves the machine.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/nomadicmehul/cadence" target="_blank" rel="noopener">
+        Clone the repo <span class="arrow">→</span>
+      </a>
+      <a class="btn" href="#install">See the 60-second install</a>
+      <a class="btn" href="https://github.com/nomadicmehul/cadence/blob/main/ROADMAP.md" target="_blank" rel="noopener">
+        Read the roadmap
+      </a>
+    </div>
+
+    <div class="pipeline" aria-label="Content pipeline stages">
+      <div class="stage"><div class="num">01</div><div class="name">Ideas</div><div class="note">From topics, reflections, or your own brain.</div></div>
+      <div class="stage"><div class="num">02</div><div class="name">Drafts</div><div class="note">Claude writes in your voice. Score and rewrite.</div></div>
+      <div class="stage"><div class="num">03</div><div class="name">Scheduled</div><div class="note">Auto-balance across weekdays and pillars.</div></div>
+      <div class="stage"><div class="num">04</div><div class="name">Published</div><div class="note">Copy and paste into LinkedIn.</div></div>
+      <div class="stage"><div class="num">05</div><div class="name">Analytics</div><div class="note">Import the xlsx, log impressions and likes.</div></div>
+      <div class="stage"><div class="num">06</div><div class="name">Repurpose</div><div class="note">Winners feed back as positive examples.</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <p class="kicker">Features</p>
+    <h2>Eight tabs. One feedback loop.</h2>
+    <p class="sub">
+      Every part of the app feeds the next. Today's analytics become tomorrow's
+      hooks. The AI sees exactly what you see, with no hidden context.
+    </p>
+
+    <div class="feature-grid">
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2 7h7l-5.5 4 2 7L12 16l-5.5 4 2-7L3 9h7z"/></svg>
+        </div>
+        <h3>Weekly brain reflection</h3>
+        <p>One button summarises the last seven days, names the pillar that's overperforming, and drops three fresh ideas into the bank tagged auto-reflection.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a8 8 0 0 1 16 0v3l1.4 2.8a1 1 0 0 1-.9 1.4H3.5a1 1 0 0 1-.9-1.4L4 14z"/><path d="M9 18a3 3 0 0 0 6 0"/></svg>
+        </div>
+        <h3>Topic intake from RSS</h3>
+        <p>Pull headlines from Hacker News, dev.to, vendor blogs. Paste a homepage URL and Cadence autodiscovers the feed. One click turns any headline into an angled idea in your voice.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><path d="M3 4v5h5"/></svg>
+        </div>
+        <h3>Memory loop</h3>
+        <p>Top performers, voice samples, and discarded ideas are injected into every prompt. Claude learns what worked, what flopped, and what you already rejected. No re-pitching.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a4 4 0 0 1-4 4H7l-4 4V5a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>
+        </div>
+        <h3>Voice-matched drafts</h3>
+        <p>Paste five of your best past posts. Cadence samples three at random for every generation, so the model writes in your rhythm. Not generic AI prose.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+        </div>
+        <h3>Auto-scheduling</h3>
+        <p>Drop ready drafts into the calendar with one click. Spreads them across weekdays at your preferred hours, balanced by pillar percentage.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 4-6"/></svg>
+        </div>
+        <h3>Analytics import</h3>
+        <p>Drop in LinkedIn's Creator Analytics xlsx. Cadence auto-matches each row to your drafts by body snippet first, date proximity second. No copy-pasting per post.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 21l3-3"/><path d="M5 17a5 5 0 0 1 0-10 5 5 0 0 1 5 5"/><path d="M14 11a5 5 0 0 1 5 5 5 5 0 0 1-5 5"/><path d="M9 11h5"/></svg>
+        </div>
+        <h3>Engagement helper</h3>
+        <p>Generate three thoughtful comments for any post you paste in. Comments match your voice samples too, so you stay consistent even when commenting on others.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1l3 6 6 1-4 5 1 6-6-3-6 3 1-6-4-5 6-1z"/></svg>
+        </div>
+        <h3>Hook and voice scoring</h3>
+        <p>Score any draft on Hook strength and Voice match, 1 to 10 each, with three concrete improvement notes. Lets you triage which drafts are ready to ship.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
+        </div>
+        <h3>Backup &amp; migrate</h3>
+        <p>Move your entire pipeline between machines as a JSON file in 60 seconds. API key is redacted by default. CLI, HTTP, and one-click UI all share the same code path.</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <p class="kicker">What it isn't</p>
+    <h2>Cadence is deliberately not a SaaS.</h2>
+    <p class="sub">
+      It runs on your laptop. There is no hosted version, no telemetry, no
+      account, no team plan. The whole app is a single Flask file plus vanilla
+      JavaScript that you read end to end in an afternoon.
+    </p>
+
+    <div class="compare">
+      <div class="card yes">
+        <h3 style="color: var(--good)">What you get</h3>
+        <ul>
+          <li>Single SQLite file holds every idea, draft, and analytics row</li>
+          <li>Your Anthropic API key, or your Claude Code CLI session, automatically</li>
+          <li>One Python file you can fork, tune, and own forever</li>
+          <li>JSON backup that works between Macs in under a minute</li>
+          <li>MIT licensed, no usage quotas, no rate limits beyond Claude's</li>
+        </ul>
+      </div>
+      <div class="card no">
+        <h3 style="color: var(--warn)">What you don't get</h3>
+        <ul>
+          <li>Hosted SaaS or signup flow. Cadence is local-clone-only</li>
+          <li>LinkedIn API integration. LinkedIn doesn't expose personal post analytics</li>
+          <li>Browser automation or scraping. Against LinkedIn's ToS</li>
+          <li>npm, React, or any build step. Open run.sh and you're done</li>
+          <li>A team mode. Single user, single laptop, by design</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <p class="kicker">60-second install</p>
+    <h2>Three commands, one terminal.</h2>
+    <p class="sub">
+      Python 3.10 or later. The setup script creates a virtualenv, installs four
+      dependencies, and starts the server on
+      <code>http://127.0.0.1:5050</code>.
+    </p>
+
+    <div class="install-row">
+      <div class="copy">
+        <h3>Clone &amp; run</h3>
+        <p>
+          On first boot, an onboarding modal asks for your name, bio, audience,
+          and three of your best past posts to seed the voice library.
+        </p>
+        <p style="margin-top: 18px">
+          No Anthropic API key? Install
+          <a href="https://docs.claude.com/en/docs/claude-code" target="_blank" rel="noopener">Claude Code</a>
+          and run <code>claude login</code> once. Cadence auto-detects either
+          backend and falls back transparently.
+        </p>
+      </div>
+      <pre><code>git clone https://github.com/nomadicmehul/cadence.git
+cd cadence
+./run.sh</code></pre>
+    </div>
+  </div>
+</section>
+
+<section id="roadmap">
+  <div class="wrap">
+    <p class="kicker">Roadmap</p>
+    <h2>Shipped, in flight, and on the bench.</h2>
+    <p class="sub">
+      Each phase is self-contained. Phase 1 (open-source readiness),
+      Phase 2 (the weekly brain reflection), and Phase 3.b (RSS topic
+      intake with autodiscovery) are live. Phase 3.a (Anthropic web
+      search) and Phase 4 (reusable Claude skills) are next. See the
+      <a href="https://github.com/nomadicmehul/cadence/blob/main/ROADMAP.md" target="_blank" rel="noopener">full roadmap</a> for what's in
+      and what's out of scope.
+    </p>
+
+    <div class="feature-grid">
+      <div class="card" style="border-color: rgba(52, 211, 153, 0.35)">
+        <div class="ico" aria-hidden="true" style="color: var(--good)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        </div>
+        <h3>Shipped</h3>
+        <p>
+          Onboarding · pillars · schema migrations · JSON backup · weekly
+          brain reflection · RSS topic intake with autodiscovery ·
+          voice-matched comments · memory feedback loop.
+        </p>
+      </div>
+      <div class="card" style="border-color: rgba(251, 191, 36, 0.35)">
+        <div class="ico" aria-hidden="true" style="color: var(--warn)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </div>
+        <h3>Next up</h3>
+        <p>
+          Anthropic web search for topic intake. Semantic memory via Voyage
+          embeddings. Auto-promote winners to the voice library. Hook A/B
+          experiments.
+        </p>
+      </div>
+      <div class="card">
+        <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 14V8a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v8a4 4 0 0 0 4 4h6"/><path d="M16 18l2 2 4-4"/></svg>
+        </div>
+        <h3>Out of scope</h3>
+        <p>
+          A hosted SaaS. LinkedIn API for personal analytics (doesn't exist).
+          Browser scraping (against ToS). Multi-user mode. npm / build step.
+          See the roadmap for why.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>
+      Built by <a href="https://github.com/nomadicmehul" target="_blank" rel="noopener">@nomadicmehul</a>.
+      MIT licensed.
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/nomadicmehul/cadence" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/nomadicmehul/cadence/blob/main/README.md" target="_blank" rel="noopener">README</a>
+      <a href="https://github.com/nomadicmehul/cadence/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+      <a href="https://github.com/nomadicmehul/cadence/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+      <a href="https://github.com/nomadicmehul/cadence/blob/main/SECURITY.md" target="_blank" rel="noopener">Security</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
