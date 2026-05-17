@@ -135,8 +135,11 @@ drafts by body-snippet similarity first, falling back to date proximity.
 ## Tech
 
 - **Backend**: Flask + SQLite, single file (`app.py`)
-- **AI**: Anthropic SDK with Claude Sonnet 4.5 by default (override with
-  `CLAUDE_MODEL` env var). Prompt caching marks the static system block
+- **AI**: Anthropic SDK with Claude Sonnet 4.5 by default. Switch to
+  Opus 4.5, Haiku 4.5, or pin a specific version from **Settings → AI
+  backend → Model**. The picker writes to the `settings` table (wins
+  over the `CLAUDE_MODEL` env var, which still works as a fallback for
+  scripted setups). Prompt caching marks the static system block
   (`SYSTEM_BASE` + creator profile + voice samples + role instructions)
   as `cache_control: ephemeral` on every AI call that benefits from it
   (brain reflection, topic-to-idea, comment generator).

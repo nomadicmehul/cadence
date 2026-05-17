@@ -1557,7 +1557,117 @@ function renderAuthCards(a) {
     apiChip.className = "status-chip";
     if (clearBtn) clearBtn.hidden = true;
   }
+
+  renderModelPicker(a);
 }
+
+// Model picker: dropdown of known models, optional Custom text input,
+// Save button. We render fresh each time settings load so the source
+// indicator and selection stay in sync with what the backend actually
+// resolved via get_model().
+function renderModelPicker(a) {
+  const sel = $("#set-model");
+  if (!sel) return;
+  const known = a.known_models || [];
+  const dbVal = a.model_setting || "";
+  const envVal = a.model_env || "";
+  const builtin = a.builtin_default_model || "claude-sonnet-4-5";
+  const active = a.active_model || (a.provider === "cli" ? "" : builtin);
+
+  // Build options: known models, then "Custom" sentinel.
+  const knownIds = new Set(known.map(m => m.id));
+  const customOpt = `<option value="__custom__">Custom…</option>`;
+  const useDefaultOpt = `<option value="">(Use env var or built-in default)</option>`;
+  const knownOpts = known
+    .map(m => `<option value="${escape(m.id)}">${escape(m.label)}</option>`)
+    .join("");
+
+  sel.innerHTML = useDefaultOpt + knownOpts + customOpt;
+
+  // Decide which option to select:
+  // - If DB is empty: show "Use default"
+  // - If DB matches a known model: select that
+  // - Otherwise: select Custom and fill the text input
+  const customInput = $("#set-model-custom");
+  if (!dbVal) {
+    sel.value = "";
+    customInput.hidden = true;
+    customInput.value = "";
+  } else if (knownIds.has(dbVal)) {
+    sel.value = dbVal;
+    customInput.hidden = true;
+    customInput.value = "";
+  } else {
+    sel.value = "__custom__";
+    customInput.hidden = false;
+    customInput.value = dbVal;
+  }
+
+  // Source indicator: tells the user where the active model is coming from.
+  const src = $("#model-source");
+  if (a.provider === "cli") {
+    src.textContent = "n/a (CLI backend)";
+    src.style.color = "var(--muted)";
+  } else if (dbVal) {
+    src.textContent = `active: ${active} (from Settings)`;
+    src.style.color = "var(--text)";
+  } else if (envVal) {
+    src.textContent = `active: ${active} (from CLAUDE_MODEL env)`;
+    src.style.color = "var(--text)";
+  } else {
+    src.textContent = `active: ${active} (built-in default)`;
+    src.style.color = "var(--muted)";
+  }
+
+  // Blurb for the currently-selected known model
+  const blurb = $("#model-blurb");
+  const selectedKnown = known.find(m => m.id === sel.value);
+  blurb.textContent = selectedKnown ? selectedKnown.blurb : "";
+
+  // Disable controls on CLI mode — the setting wouldn't take effect.
+  const cliOnly = a.provider === "cli";
+  sel.disabled = cliOnly;
+  customInput.disabled = cliOnly;
+  $("#save-model").disabled = cliOnly;
+  $("#model-row").style.opacity = cliOnly ? "0.6" : "1";
+}
+
+$("#set-model")?.addEventListener("change", (e) => {
+  const isCustom = e.target.value === "__custom__";
+  const customInput = $("#set-model-custom");
+  customInput.hidden = !isCustom;
+  if (isCustom) {
+    customInput.focus();
+  }
+  // Update blurb for known selections
+  const blurb = $("#model-blurb");
+  const opt = e.target.selectedOptions[0];
+  blurb.textContent = (!isCustom && e.target.value)
+    ? (opt.textContent + " — saved on click")
+    : (isCustom ? "Paste a full model id (e.g. claude-sonnet-4-5-20250929)." : "");
+});
+
+$("#save-model")?.addEventListener("click", async () => {
+  const sel = $("#set-model");
+  let value;
+  if (sel.value === "__custom__") {
+    value = ($("#set-model-custom").value || "").trim();
+    if (!value) return toast("Paste a model id or pick from the list", "error");
+  } else {
+    value = sel.value;  // "" means "use default"
+  }
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: { claude_model: value },
+    });
+  } catch (e) {
+    return toast(e.message || "Save failed", "error");
+  }
+  toast(value ? `Model set to ${value}` : "Model cleared — using default", "ok");
+  loadSettings();
+  refreshBrand();
+});
 
 $("#save-api-key").addEventListener("click", async () => {
   const key = $("#set-api-key").value.trim();
@@ -1723,15 +1833,26 @@ function refreshApiStatus(ok, label) {
   $("#api-status-label").textContent = label || (ok ? "Claude ready" : "no auth");
 }
 
+// Shorten a model id for the top bar pill: claude-sonnet-4-5 -> sonnet-4-5
+function shortModel(m) {
+  if (!m) return "";
+  return m.replace(/^claude-/, "");
+}
+
 async function refreshBrand() {
   const s = await api("/api/settings");
   $("#brand-sub").textContent = s.creator_name
     ? `${s.creator_name} · @${s.creator_handle || ""}`
     : "Set your profile in Settings";
   const a = s.auth || {};
-  if (a.provider === "api") refreshApiStatus(true, "Claude (API key)");
-  else if (a.provider === "cli") refreshApiStatus(true, "Claude (CLI)");
-  else refreshApiStatus(false, "no auth — Settings");
+  if (a.provider === "api") {
+    const m = shortModel(a.active_model);
+    refreshApiStatus(true, m ? `Claude (API · ${m})` : "Claude (API key)");
+  } else if (a.provider === "cli") {
+    refreshApiStatus(true, "Claude (CLI)");
+  } else {
+    refreshApiStatus(false, "no auth — Settings");
+  }
 }
 
 // =====================================================================
