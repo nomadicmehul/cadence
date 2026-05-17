@@ -374,11 +374,11 @@ DEFAULT_SETTINGS = {
 
 # Default RSS feeds seeded on first run. Generic on purpose — the user adds,
 # removes, or disables any of these from the Topics tab. Kept short so first
-# fetch isn't slow. Order matters: newest-friendly feeds first.
+# fetch isn't slow. Only proven-working feeds; if you add a new one, manually
+# curl it before committing.
 DEFAULT_TOPIC_SOURCES = [
     ("Hacker News (front page)", "https://hnrss.org/frontpage", "rss"),
-    ("dev.to (top)", "https://dev.to/feed/top/week", "rss"),
-    ("Anthropic news", "https://www.anthropic.com/news/rss.xml", "rss"),
+    ("dev.to (main feed)", "https://dev.to/feed", "rss"),
 ]
 
 
@@ -1728,6 +1728,65 @@ def _http_get_bounded(url: str, *, timeout: int, max_bytes: int) -> bytes:
         return bytes(data)
 
 
+def _looks_like_html(raw: bytes) -> bool:
+    """Cheap content sniff. Strips leading whitespace, lowercases the first
+    400 bytes, and checks for an HTML doctype or root tag. Good enough to
+    decide whether to trigger feed autodiscovery."""
+    head = raw[:400].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def _discover_feed_url(html_bytes: bytes, base_url: str) -> str | None:
+    """Scan HTML bytes for an RSS / Atom autodiscovery <link rel=alternate>.
+
+    Returns the absolutized feed URL if one is found, else None. Atom is
+    preferred over RSS when both are present (slightly more standard, but
+    either path works with feedparser downstream).
+    """
+    from html.parser import HTMLParser
+    from urllib.parse import urljoin
+
+    try:
+        text = html_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    found: list[tuple[str, str]] = []  # (type, href)
+
+    class _Finder(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag != "link":
+                return
+            ad = {k.lower(): (v or "") for k, v in attrs}
+            rel = ad.get("rel", "").lower()
+            t = ad.get("type", "").lower()
+            href = ad.get("href")
+            if not href or "alternate" not in rel:
+                return
+            if "rss" in t or "atom" in t:
+                found.append((t, href))
+
+        def error(self, message):  # never raise on malformed HTML
+            pass
+
+    parser = _Finder(convert_charrefs=True)
+    try:
+        # HTMLParser stops at </head> in pathological docs but most pages put
+        # discovery links inside <head>, so a single feed() call is fine.
+        parser.feed(text)
+    except Exception:
+        # HTMLParser can raise on truly broken input; swallow and treat as
+        # "no feed found" rather than crashing the whole fetch.
+        pass
+
+    if not found:
+        return None
+
+    # Atom first, then RSS, then anything else.
+    found.sort(key=lambda x: 0 if "atom" in x[0] else 1)
+    return urljoin(base_url, found[0][1])
+
+
 def _parse_feed_entries(raw: bytes) -> list[dict]:
     """Run feedparser on raw bytes; normalise the bits we actually care about."""
     try:
@@ -1784,6 +1843,7 @@ def fetch_topics(*, source_ids: list[int] | None = None) -> dict:
         result = {
             "source_id": src["id"], "source_name": src["name"],
             "inserted": 0, "skipped_existing": 0, "error": None,
+            "discovered_url": None,
         }
         try:
             raw = _http_get_bounded(
@@ -1791,6 +1851,22 @@ def fetch_topics(*, source_ids: list[int] | None = None) -> dict:
                 timeout=TOPIC_FETCH_TIMEOUT_SEC,
                 max_bytes=TOPIC_FETCH_MAX_BYTES,
             )
+
+            # Autodiscovery: if the user pasted a homepage (e.g.
+            # https://dev.to/t/googlecloud) rather than a feed URL, look in
+            # the HTML for <link rel="alternate" type="application/rss+xml">
+            # and refetch from there. One extra round-trip on misconfigured
+            # sources, zero overhead on feeds that respond with XML directly.
+            if _looks_like_html(raw):
+                discovered = _discover_feed_url(raw, src["url"])
+                if discovered and discovered != src["url"]:
+                    result["discovered_url"] = discovered
+                    raw = _http_get_bounded(
+                        discovered,
+                        timeout=TOPIC_FETCH_TIMEOUT_SEC,
+                        max_bytes=TOPIC_FETCH_MAX_BYTES,
+                    )
+
             entries = _parse_feed_entries(raw)
         except Exception as e:
             result["error"] = str(e)[:200]
@@ -1818,11 +1894,32 @@ def fetch_topics(*, source_ids: list[int] | None = None) -> dict:
                     result["inserted"] += 1
                 except sqlite3.IntegrityError:
                     result["skipped_existing"] += 1
+
+            # Build an honest status message:
+            #  - if entries is empty AND we just fetched HTML with no
+            #    discoverable feed, tell the user the URL probably isn't a
+            #    feed rather than masquerading as "ok: 0 new".
+            #  - if we autodiscovered, mention the resolved URL so the user
+            #    can update their source manually if they want.
+            if entries:
+                status = f"ok: {result['inserted']} new"
+                if result["discovered_url"]:
+                    status += f" (via {result['discovered_url']})"
+            elif result["discovered_url"]:
+                status = (
+                    f"ok: 0 entries at autodiscovered "
+                    f"{result['discovered_url']}"
+                )
+            elif _looks_like_html(raw):
+                status = "ok: 0 entries (URL returned HTML with no RSS/Atom link)"
+            else:
+                status = "ok: 0 entries (feed parsed but had no items)"
+
             conn.execute(
                 "UPDATE topic_sources SET last_fetched_at=?, last_status=? "
                 "WHERE id=?",
                 (datetime.utcnow().isoformat(timespec="seconds"),
-                 f"ok: {result['inserted']} new", src["id"]),
+                 status, src["id"]),
             )
         inserted_total += result["inserted"]
         per_source.append(result)
