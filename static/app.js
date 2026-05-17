@@ -161,8 +161,68 @@ async function loadDashboard() {
           <div style="font-size:22px;font-weight:600">${d.totals.f.toLocaleString()}</div></div>
       </div>`;
 
+    await loadReflectionCard();
     await loadMemorySnapshot();
   } catch (e) { toast("Could not load dashboard: " + e.message, "error"); }
+}
+
+async function loadReflectionCard() {
+  const target = $("#reflection-card");
+  if (!target) return;
+  try {
+    const list = await api("/api/brain/reflections?limit=1");
+    const latest = list[0];
+    if (!latest) {
+      target.innerHTML = `
+        <div class="memory-empty">
+          No reflection yet. Hit <b>Run reflection now</b> to have Claude read
+          your last week and drop 3 fresh ideas into the bank.
+        </div>`;
+      return;
+    }
+    const sig = latest.signals || {};
+    const sigChips = [
+      sig.best_pillar ? `<span class="status-chip ready">winner pillar: ${escape(sig.best_pillar)}</span>` : "",
+      sig.best_format ? `<span class="status-chip ready">winner format: ${escape(sig.best_format)}</span>` : "",
+      sig.weakest_pillar ? `<span class="status-chip">lagging: ${escape(sig.weakest_pillar)}</span>` : "",
+    ].filter(Boolean).join(" ");
+    const topics = Array.isArray(sig.topics_to_double_down_on)
+      ? sig.topics_to_double_down_on.filter(Boolean).slice(0, 5)
+      : [];
+    const topicsHtml = topics.length
+      ? `<div class="muted tiny" style="margin-top:8px">Double down: ${topics.map(t => `<code>${escape(t)}</code>`).join(" · ")}</div>`
+      : "";
+    const ideasN = (latest.ideas_created || []).length;
+    target.innerHTML = `
+      <div class="muted tiny" style="margin-bottom:6px">
+        ${fmtDateTime(latest.created_at)} · ${latest.window_days}-day window
+        ${ideasN ? ` · dropped ${ideasN} idea${ideasN === 1 ? "" : "s"} into the bank` : ""}
+      </div>
+      <div style="white-space:pre-wrap;line-height:1.55">${escape(latest.summary || "")}</div>
+      ${sigChips ? `<div style="margin-top:10px">${sigChips}</div>` : ""}
+      ${topicsHtml}
+      ${ideasN ? `<button class="btn sm" id="reflection-jump-ideas" style="margin-top:10px">See ideas in Ideas Bank</button>` : ""}`;
+    const jump = $("#reflection-jump-ideas");
+    if (jump) jump.addEventListener("click", () => switchTab("ideas"));
+  } catch (e) {
+    target.innerHTML = `<div class="memory-empty">Couldn't load reflection: ${escape(e.message)}</div>`;
+  }
+}
+
+async function runReflection() {
+  const btn = $("#reflect-now");
+  toast("Reflecting on the last 7 days… ~15s", "");
+  await withSpinner(btn, async () => {
+    const r = await api("/api/brain/reflect", { method: "POST", body: { window_days: 7 } });
+    if (!r.ok) {
+      toast("Reflection failed: " + (r.error || "unknown"), "error");
+      return;
+    }
+    const n = (r.ideas_created || []).length;
+    toast(`Reflection saved. ${n} fresh idea${n === 1 ? "" : "s"} added.`, "ok");
+    await loadReflectionCard();
+    await loadMemorySnapshot();
+  })();
 }
 
 async function loadMemorySnapshot() {
@@ -236,6 +296,8 @@ document.querySelector("#view-dashboard").addEventListener("click", (e) => {
     if (btn.dataset.action === "insights") runInsights();
   }, 50);
 });
+
+$("#reflect-now")?.addEventListener("click", runReflection);
 
 // =====================================================================
 // PILLARS (used everywhere)

@@ -14,10 +14,11 @@ import json
 # ---------------------------------------------------------------------------
 
 def test_app_imports_and_db_initializes(app_module):
-    """init_db ran without error and applied the baseline migration."""
+    """init_db ran without error and applied every migration up to current."""
     with app_module.db_cursor() as conn:
         rows = conn.execute("SELECT version FROM schema_version").fetchall()
-    assert {r["version"] for r in rows} == {app_module.CURRENT_SCHEMA_VERSION}
+    expected = set(range(1, app_module.CURRENT_SCHEMA_VERSION + 1))
+    assert {r["version"] for r in rows} == expected
 
 
 def test_first_run_state_is_clean(client):

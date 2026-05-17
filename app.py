@@ -134,6 +134,15 @@ CREATE TABLE IF NOT EXISTS engagement_tasks (
     completed INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS reflections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    window_days INTEGER DEFAULT 7,
+    summary TEXT,
+    signals_json TEXT,
+    ideas_created_json TEXT
+);
 """
 
 
@@ -172,7 +181,7 @@ def db_cursor():
 # run their SQL, and must be idempotent (safe to re-run if interrupted).
 # ---------------------------------------------------------------------------
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def _migration_v1(conn: sqlite3.Connection) -> None:
@@ -180,8 +189,28 @@ def _migration_v1(conn: sqlite3.Connection) -> None:
     pass
 
 
+def _migration_v2(conn: sqlite3.Connection) -> None:
+    """Add the reflections table for the weekly brain loop.
+
+    Idempotent: SCHEMA already creates the table with IF NOT EXISTS, so this
+    is a no-op on fresh installs. Existing DBs picked it up via the same
+    executescript() in init_db() before MIGRATIONS run, so really we just need
+    to be recorded as applied. Kept explicit for the schema_version trail.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS reflections ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP, "
+        "window_days INTEGER DEFAULT 7, "
+        "summary TEXT, "
+        "signals_json TEXT, "
+        "ideas_created_json TEXT)"
+    )
+
+
 MIGRATIONS: list[tuple[int, Any]] = [
     (1, _migration_v1),
+    (2, _migration_v2),
 ]
 
 
@@ -353,7 +382,21 @@ def auth_status() -> dict:
     }
 
 
-def _call_via_api(system: str, user: str, model: str | None,
+def _system_blocks_to_str(system: str | list) -> str:
+    """Flatten a structured system prompt back to a plain string. Used for the
+    CLI backend, which has no concept of prompt caching."""
+    if isinstance(system, str):
+        return system
+    parts = []
+    for block in system:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            parts.append(block.get("text", ""))
+    return "\n\n".join(p for p in parts if p)
+
+
+def _call_via_api(system: str | list, user: str, model: str | None,
                   max_tokens: int | None) -> str:
     if Anthropic is None:
         raise RuntimeError(
@@ -375,7 +418,7 @@ def _call_via_api(system: str, user: str, model: str | None,
     return "".join(block.text for block in msg.content if block.type == "text")
 
 
-def _call_via_cli(system: str, user: str) -> str:
+def _call_via_cli(system: str | list, user: str) -> str:
     """Use the local Claude Code CLI. Reuses the user's existing browser auth.
 
     Critical: we strip any ANTHROPIC_* env vars before invoking the CLI.
@@ -399,7 +442,7 @@ def _call_via_cli(system: str, user: str) -> str:
     cmd = [
         cli_path,
         "-p", user,
-        "--append-system-prompt", system,
+        "--append-system-prompt", _system_blocks_to_str(system),
         "--output-format", "text",
     ]
     try:
@@ -420,7 +463,7 @@ def _call_via_cli(system: str, user: str) -> str:
     return r.stdout
 
 
-def call_claude(system: str, user: str, model: str | None = None,
+def call_claude(system: str | list, user: str, model: str | None = None,
                 max_tokens: int | None = None, json_mode: bool = False) -> str:
     """Run a single Claude completion via whichever backend is available.
 
@@ -508,18 +551,30 @@ def winners_block(pillar_id: int | None = None, limit: int = 3) -> str:
     return "\n".join(parts)
 
 
-def discarded_block(limit: int = 8) -> str:
-    """Recently-rejected ideas. The user said 'no' — don't recycle them."""
+def discarded_block(limit: int = 20) -> str:
+    """Recently-rejected ideas. The user said 'no' — don't recycle them,
+    and don't pitch anything semantically close either. We include the hook
+    line so the model has more than a title to compare against."""
     with db_cursor() as conn:
         rows = conn.execute(
-            "SELECT title FROM ideas WHERE status='discarded' "
+            "SELECT title, hook FROM ideas WHERE status='discarded' "
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
     if not rows:
         return ""
-    titles = "\n".join(f"- {r['title']}" for r in rows)
-    return f"DISCARDED PATTERNS (the user already said no — don't pitch these again):\n{titles}"
+    lines = []
+    for r in rows:
+        line = f"- {r['title']}"
+        if r["hook"]:
+            line += f" — hook: {r['hook']}"
+        lines.append(line)
+    body = "\n".join(lines)
+    return (
+        "DISCARDED PATTERNS (the user already said no to these — don't pitch "
+        "them again, and don't pitch anything SEMANTICALLY SIMILAR either, "
+        "even with different wording or framing):\n" + body
+    )
 
 
 def memory_snapshot() -> dict:
@@ -718,7 +773,7 @@ def _row_count(table: str) -> int:
 
 EXPORT_TABLES = (
     "settings", "pillars", "ideas", "drafts", "analytics",
-    "voice_samples", "engagement_tasks",
+    "voice_samples", "engagement_tasks", "reflections",
 )
 
 
@@ -757,7 +812,8 @@ def import_from_dict(payload: dict, *, mode: str = "replace") -> dict:
         if mode == "replace":
             # Order matters because of FK refs; child tables first.
             for tbl in ("analytics", "engagement_tasks", "drafts",
-                        "ideas", "voice_samples", "pillars", "settings"):
+                        "ideas", "voice_samples", "pillars", "settings",
+                        "reflections"):
                 conn.execute(f"DELETE FROM {tbl}")
         for tbl in EXPORT_TABLES:
             rows = tables.get(tbl) or []
@@ -960,10 +1016,18 @@ def api_ideas_generate():
         {pillar_text}
         {theme_text}
 
-        AVOID repeating these recent ideas:
+        AVOID repeating these recent ideas (by topic, by hook, or by framing):
         {avoid}
 
         {memory_text}
+
+        SEMANTIC DEDUP RULES (this is the rule the model usually breaks):
+        - Treat any idea above as "claimed" not just by title but by THEME.
+          "Moving off Kubernetes" and "We killed K8s" are the same idea.
+        - If your draft idea is semantically close to something in the recent
+          or DISCARDED list, throw it out and pick a different angle.
+        - Variety target: 5 ideas should cover 5 distinct themes, not 5
+          re-skins of one theme.
 
         For each idea give:
         - title: 6-10 word working title
@@ -1281,6 +1345,223 @@ def api_drafts_repurpose(did):
 def api_memory():
     """What context the AI is currently drawing from."""
     return jsonify(memory_snapshot())
+
+
+# ---------------------------------------------------------------------------
+# Routes — brain (weekly reflection loop)
+#
+# A reflection reads the last N days of analytics, voice, and discarded ideas,
+# asks Claude to summarise what's working and drop 3 fresh ideas into the
+# pipeline. Triggered manually via the Dashboard button or `python app.py
+# reflect`. No in-process scheduler — keeps Flask stateless.
+# ---------------------------------------------------------------------------
+
+
+def _gather_reflection_context(window_days: int) -> dict:
+    """Pull the data the reflection prompt needs. Pure DB; no AI."""
+    since = (datetime.utcnow() - timedelta(days=window_days)).isoformat(
+        timespec="seconds"
+    )
+    with db_cursor() as conn:
+        published = conn.execute(
+            "SELECT d.id, d.title, d.format, p.name as pillar, "
+            "COALESCE(SUM(a.impressions),0) impressions, "
+            "COALESCE(SUM(a.likes),0) likes, "
+            "COALESCE(SUM(a.comments),0) comments, "
+            "COALESCE(SUM(a.follows),0) follows "
+            "FROM drafts d "
+            "LEFT JOIN analytics a ON a.draft_id = d.id "
+            "LEFT JOIN pillars p ON p.id = d.pillar_id "
+            "WHERE d.status='published' AND COALESCE(d.posted_at, d.updated_at) >= ? "
+            "GROUP BY d.id ORDER BY likes DESC",
+            (since,),
+        ).fetchall()
+        discarded = conn.execute(
+            "SELECT title, hook FROM ideas WHERE status='discarded' "
+            "AND created_at >= ? ORDER BY created_at DESC LIMIT 15",
+            (since,),
+        ).fetchall()
+        recent_reflection = conn.execute(
+            "SELECT summary FROM reflections ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        pillars = conn.execute(
+            "SELECT name, target_pct FROM pillars ORDER BY sort_order"
+        ).fetchall()
+    return {
+        "published": [dict(r) for r in published],
+        "discarded": [dict(r) for r in discarded],
+        "previous_reflection": (recent_reflection["summary"]
+                                if recent_reflection else ""),
+        "pillars": [dict(r) for r in pillars],
+    }
+
+
+def _format_reflection_table(rows: list[dict]) -> str:
+    if not rows:
+        return "(no posts published in this window)"
+    lines = ["title | format | pillar | impressions | likes | comments | follows"]
+    for r in rows:
+        lines.append(
+            f"{(r['title'] or '')[:60]} | {r['format']} | "
+            f"{r['pillar'] or 'unassigned'} | {r['impressions']} | "
+            f"{r['likes']} | {r['comments']} | {r['follows']}"
+        )
+    return "\n".join(lines)
+
+
+def run_reflection(window_days: int = 7) -> dict:
+    """Generate a reflection. Used by both the HTTP endpoint and the CLI."""
+    ctx = _gather_reflection_context(window_days)
+    table = _format_reflection_table(ctx["published"])
+    discarded_lines = "\n".join(
+        f"- {d['title']}" + (f" — hook: {d['hook']}" if d['hook'] else "")
+        for d in ctx["discarded"]
+    ) or "(none)"
+    pillars_lines = ", ".join(
+        f"{p['name']} ({p['target_pct']}%)" for p in ctx["pillars"]
+    )
+    prev = ctx["previous_reflection"] or "(no prior reflection)"
+
+    # Two-block system prompt. The static part is identical across calls so
+    # the API can cache it. The CLI fallback just joins everything back.
+    static_system = (
+        SYSTEM_BASE + "\n\n" + creator_block() + voice_block()
+        + "\n\nYou are now acting as a weekly content coach. Be specific. "
+          "Quote real numbers from the table when you can. Avoid generic "
+          "advice. If a pillar is overperforming, name it."
+    )
+    system = [
+        {"type": "text", "text": static_system,
+         "cache_control": {"type": "ephemeral"}},
+    ]
+
+    user = textwrap.dedent(f"""
+        Reflect on the last {window_days} days for this creator.
+
+        ACTIVE PILLARS (with target mix %):
+        {pillars_lines}
+
+        PUBLISHED POSTS IN WINDOW:
+        {table}
+
+        RECENTLY DISCARDED IDEAS (don't pitch these or anything semantically
+        similar):
+        {discarded_lines}
+
+        PREVIOUS REFLECTION (for continuity, may be stale):
+        {prev}
+
+        Return ONLY valid JSON in this exact shape:
+        {{
+          "summary": "5-7 sentence paragraph. Start with the single biggest signal. Name pillars and formats. End with one concrete experiment for next week.",
+          "signals": {{
+            "best_pillar": "name or null",
+            "best_format": "story|list|contrarian|tutorial|carousel|bts or null",
+            "weakest_pillar": "name or null",
+            "topics_to_double_down_on": ["...", "...", "..."]
+          }},
+          "next_ideas": [
+            {{"title": "6-10 word title", "hook": "the first line", "angle": "1-2 sentences", "format": "story|list|contrarian|tutorial|bts", "pillar": "name from active pillars or null"}},
+            {{"title": "...", "hook": "...", "angle": "...", "format": "...", "pillar": "..."}},
+            {{"title": "...", "hook": "...", "angle": "...", "format": "...", "pillar": "..."}}
+          ]
+        }}
+    """).strip()
+
+    text = call_claude(system, user, json_mode=True, max_tokens=1500)
+    data = json.loads(text)
+
+    # Map pillar names back to ids for the auto-created ideas
+    with db_cursor() as conn:
+        pillar_map = {
+            r["name"].lower(): r["id"]
+            for r in conn.execute("SELECT id, name FROM pillars").fetchall()
+        }
+
+    created_idea_ids: list[int] = []
+    with db_cursor() as conn:
+        for it in data.get("next_ideas", []) or []:
+            pname = (it.get("pillar") or "").strip().lower()
+            pid = pillar_map.get(pname)
+            angle = (it.get("angle") or "")
+            fmt = it.get("format") or "story"
+            angle_with_format = f"{angle}\n\n[format: {fmt}]"
+            cur = conn.execute(
+                "INSERT INTO ideas(pillar_id, title, hook, angle, source) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    pid,
+                    (it.get("title") or "Untitled")[:200],
+                    it.get("hook", ""),
+                    angle_with_format,
+                    "auto-reflection",
+                ),
+            )
+            created_idea_ids.append(cur.lastrowid)
+
+        cur = conn.execute(
+            "INSERT INTO reflections(window_days, summary, signals_json, "
+            "ideas_created_json) VALUES (?, ?, ?, ?)",
+            (
+                window_days,
+                data.get("summary", ""),
+                json.dumps(data.get("signals") or {}),
+                json.dumps(created_idea_ids),
+            ),
+        )
+        reflection_id = cur.lastrowid
+
+    return {
+        "id": reflection_id,
+        "summary": data.get("summary", ""),
+        "signals": data.get("signals") or {},
+        "ideas_created": created_idea_ids,
+        "window_days": window_days,
+    }
+
+
+@app.post("/api/brain/reflect")
+def api_brain_reflect():
+    payload = request.get_json(silent=True) or {}
+    try:
+        window = int(payload.get("window_days", 7))
+    except (TypeError, ValueError):
+        window = 7
+    window = max(1, min(window, 90))
+    try:
+        result = run_reflection(window_days=window)
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/brain/reflections")
+def api_brain_reflections():
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except ValueError:
+        limit = 10
+    limit = max(1, min(limit, 50))
+    with db_cursor() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, window_days, summary, signals_json, "
+            "ideas_created_json FROM reflections "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["signals"] = json.loads(d.pop("signals_json") or "{}")
+        except json.JSONDecodeError:
+            d["signals"] = {}
+        try:
+            d["ideas_created"] = json.loads(d.pop("ideas_created_json") or "[]")
+        except json.JSONDecodeError:
+            d["ideas_created"] = []
+        out.append(d)
+    return jsonify(out)
 
 
 @app.post("/api/drafts/<int:did>/score")
@@ -2049,6 +2330,25 @@ def _cli_export(path: str, *, include_api_key: bool) -> int:
     return 0
 
 
+def _cli_reflect(window_days: int) -> int:
+    try:
+        result = run_reflection(window_days=window_days)
+    except Exception as e:
+        print(f"Reflection failed: {e}", file=sys.stderr)
+        return 2
+    print(f"Reflection #{result['id']} (window={result['window_days']}d)")
+    print("-" * 60)
+    print(result["summary"])
+    print("-" * 60)
+    if result["signals"]:
+        print("Signals:")
+        for k, v in result["signals"].items():
+            print(f"  {k}: {v}")
+    n = len(result["ideas_created"])
+    print(f"Dropped {n} fresh idea(s) into the pipeline.")
+    return 0
+
+
 def _cli_import(path: str, *, mode: str, yes: bool) -> int:
     p = Path(path)
     if not p.exists():
@@ -2096,6 +2396,15 @@ def _build_cli() -> argparse.ArgumentParser:
         "-y", "--yes", action="store_true", help="Skip the confirmation prompt.",
     )
 
+    p_reflect = sub.add_parser(
+        "reflect",
+        help="Run the weekly brain reflection — same as the Dashboard button.",
+    )
+    p_reflect.add_argument(
+        "--days", type=int, default=7,
+        help="Lookback window in days (default: 7).",
+    )
+
     sub.add_parser("serve", help="Start the web server (default).")
     return parser
 
@@ -2107,6 +2416,8 @@ if __name__ == "__main__":
         sys.exit(_cli_export(args.path, include_api_key=args.include_api_key))
     if args.cmd == "import":
         sys.exit(_cli_import(args.path, mode=args.mode, yes=args.yes))
+    if args.cmd == "reflect":
+        sys.exit(_cli_reflect(window_days=max(1, min(args.days, 90))))
     # Default: serve
     port = int(os.getenv("PORT", "5050"))
     print(f"\n  Cadence running at http://127.0.0.1:{port}\n")

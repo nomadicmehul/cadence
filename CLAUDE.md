@@ -10,6 +10,23 @@ already hit.
 
 ---
 
+## Branch and commit conventions
+
+These rules are load-bearing for this repo. Don't relax them without asking.
+
+- **Branches start with `feature/`.** Every work branch in this repo is
+  `feature/<short-kebab-topic>` (e.g. `feature/brain-loop`,
+  `feature/semantic-memory`). Never commit to `main` directly. If you're on a
+  `claude/<auto>` worktree branch from session-start, rename it before the
+  first commit: `git branch -m feature/<topic>`.
+- **No `Co-Authored-By: Claude` trailer.** Commits in this repo are authored
+  by the human user only. Do not append the Claude / Anthropic co-author
+  trailer that other repos sometimes use. The commit message body should
+  read as if a human wrote it.
+- **One commit per logical change.** Don't bundle unrelated edits into a
+  single commit. The brain-loop work, a refactor, and a doc tweak are three
+  commits.
+
 ## What this is
 
 A self-hosted, single-user LinkedIn growth tool. **Open-source (MIT) as of
@@ -159,6 +176,32 @@ in `index.html` (line ~158, `<select id="ed-format">`) too.
 
 ---
 
+## Brain loop (weekly reflection)
+
+`POST /api/brain/reflect` and `python app.py reflect` both call
+`run_reflection(window_days=N)`. The function:
+
+1. Pulls last N days of published-post analytics, recently discarded ideas,
+   the previous reflection's summary, and active pillars.
+2. Sends a two-block system prompt: a static block (`SYSTEM_BASE +
+   creator_block + voice_block + coach instructions`) marked with
+   `cache_control: ephemeral` so the API can cache it, and a variable user
+   block with the actual data.
+3. Asks Claude for JSON with `summary`, `signals` (best pillar/format,
+   weakest pillar, topics to double down), and `next_ideas` (3 fresh ones).
+4. Inserts the 3 ideas into the `ideas` table with `source='auto-reflection'`
+   and the matched pillar (by case-insensitive name lookup) so they appear in
+   the Ideas Bank tagged accordingly.
+5. Writes the row to `reflections`.
+
+The Dashboard "This week's signal" card renders the latest reflection.
+Triggered manually for now — no in-process cron. For automation, wire
+`python app.py reflect` into macOS launchd or any other scheduler.
+
+The CLI backend (`claude` binary) doesn't support prompt caching; the
+`_system_blocks_to_str` helper flattens the structured system prompt back to
+a string before invoking the CLI. Cache savings apply only on API mode.
+
 ## Memory feedback loop (the killer feature)
 
 Three context blocks injected into AI prompts:
@@ -198,6 +241,9 @@ Defined in `SCHEMA` constant in `app.py`. Tables:
 - `voice_samples` — content, label
 - `engagement_tasks` — draft_id, type (comment / follow_up / respond),
   details, due_date, completed
+- `reflections` — weekly brain loop output. window_days, summary,
+  signals_json (best/weakest pillar, best format, topics), ideas_created_json
+  (list of idea ids dropped into the pipeline by that reflection).
 
 ### Migrations (added in Phase 1)
 
@@ -459,6 +505,9 @@ POST /api/settings/clear-api-key    # remove the saved key (dirty-key recovery)
 
 GET  /api/onboarding/status         # {first_run, has_pillars, has_voice_samples}
 POST /api/onboarding/complete       # write profile + seed voice samples in one call
+
+POST /api/brain/reflect             # weekly reflection: summary + 3 auto-ideas (body: {window_days})
+GET  /api/brain/reflections         # list past reflections (?limit=10)
 
 GET  /api/backup/export             # download full DB as JSON (?redact=0 keeps API key)
 POST /api/backup/import             # body {payload, mode: 'replace'|'merge'}
