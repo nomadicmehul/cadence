@@ -280,6 +280,23 @@
         </div>
       </div>
 
+      <div class="model-row" id="model-row" style="margin-top:18px;border-top:1px solid var(--line);padding-top:14px">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:8px">
+          <b style="font-size:14px">Model</b>
+          <span class="muted tiny" id="model-source">…</span>
+        </div>
+        <p class="muted tiny" style="margin:0 0 8px 0">
+          Applies to the API key backend. CLI mode uses whatever model your
+          <code>claude</code> install is configured with.
+        </p>
+        <div class="form-row" style="gap:6px;align-items:center">
+          <select id="set-model" style="flex:1"></select>
+          <input type="text" id="set-model-custom" placeholder="claude-sonnet-4-5-20250929" hidden style="flex:1" />
+          <button class="btn sm" id="save-model">Save</button>
+        </div>
+        <p class="muted tiny" id="model-blurb" style="margin:6px 0 0 0">&nbsp;</p>
+      </div>
+
       <div class="ed-row" style="margin-top:14px">
         <button class="btn primary" id="test-auth">Test connection</button>
         <span class="muted tiny" id="test-auth-out"></span>

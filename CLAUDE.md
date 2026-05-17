@@ -151,6 +151,29 @@ If the API call errors out (e.g., 401), and CLI is available, we transparently
 retry via CLI. The test endpoint `/api/auth/test` reports which backend
 actually answered.
 
+### Model resolution — DB beats env (opposite of API key resolution!)
+
+`get_model()` resolves the model for the next API call in this priority:
+
+1. Per-call argument (`call_claude(system, user, model="claude-opus-4-5")`)
+2. **DB setting** (`settings.claude_model`, written by the UI picker)
+3. `CLAUDE_MODEL` env var (legacy / CI / scripted setups)
+4. Built-in default (`BUILTIN_DEFAULT_MODEL = "claude-sonnet-4-5"`)
+
+This is intentionally **opposite** of the API key resolution (env beats DB
+there). Reasoning: the API key is a credential whose source matters for
+security audits; the model is a preference whose value matters for the
+user's UX. UI selection is the supported sticky path.
+
+`is_valid_model()` is a cheap sanity gate (starts with `claude-`, no
+whitespace, reasonable length). It rejects placeholders so a typo in
+either source doesn't silently break the next AI call. The Settings PUT
+endpoint also validates and returns 400 with a helpful message.
+
+The CLI backend ignores all of this — the `claude` CLI uses whatever
+model it's configured with. The UI dropdown disables itself when CLI is
+active, and `auth_status()` returns `active_model: ""` on CLI mode.
+
 ---
 
 ## AI generation rules

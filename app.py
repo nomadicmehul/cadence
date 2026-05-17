@@ -49,8 +49,17 @@ DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "pipeline.db"
 
-DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+BUILTIN_DEFAULT_MODEL = "claude-sonnet-4-5"
 MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "2048"))
+
+# Models exposed in the Settings dropdown. Keep this short and curated.
+# Power users can still pin a version string (e.g. claude-sonnet-4-5-20250929)
+# via the "Custom" option in the UI, or via CLAUDE_MODEL in the env.
+KNOWN_MODELS = (
+    ("claude-opus-4-5", "Claude Opus 4.5", "Smartest, slowest, ~5x cost. Worth it for reflection + analytics insights."),
+    ("claude-sonnet-4-5", "Claude Sonnet 4.5", "Balanced default. Voice match + drafts are good here."),
+    ("claude-haiku-4-5", "Claude Haiku 4.5", "Cheapest and fastest. Fine for comments and quick rewrites."),
+)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -368,6 +377,7 @@ DEFAULT_SETTINGS = {
     "target_audience": "",
     "default_format": "story",
     "anthropic_api_key": "",
+    "claude_model": "",  # empty = use env var or built-in default
     "weekly_target": "5",
     "preferred_hours": "09:00,12:30,17:30",
 }
@@ -402,6 +412,40 @@ def set_setting(key: str, value: str):
 
 
 # --- Backend selection: API key vs Claude Code CLI ---------------------------
+
+def is_valid_model(m: str | None) -> bool:
+    """Cheap sanity gate so a random string doesn't get sent as a model name.
+    We don't enumerate all valid models — Anthropic ships new ones — we just
+    reject obvious garbage. The API surfaces a real error if the name is bad."""
+    if not m:
+        return False
+    m = m.strip()
+    if not m.startswith("claude-"):
+        return False
+    if "..." in m or " " in m or len(m) < 10 or len(m) > 80:
+        return False
+    return True
+
+
+def get_model() -> str:
+    """Resolve the model to use for the next AI call.
+
+    Priority order:
+      1. DB-saved setting (UI is the supported path; this is "stickiest")
+      2. CLAUDE_MODEL env var (legacy / CI / scripted setups)
+      3. Built-in default
+
+    Per-call overrides happen inside _call_via_api by passing model=...
+    to call_claude; this helper is the fallback when no override is given.
+    """
+    db_model = (get_setting("claude_model", "") or "").strip()
+    if is_valid_model(db_model):
+        return db_model
+    env_model = (os.getenv("CLAUDE_MODEL") or "").strip()
+    if is_valid_model(env_model):
+        return env_model
+    return BUILTIN_DEFAULT_MODEL
+
 
 def is_valid_api_key(k: str | None) -> bool:
     """Reject blanks, placeholders, and obvious junk so the API path doesn't
@@ -448,12 +492,23 @@ def auth_status() -> dict:
     else:
         provider = "none"
 
+    # Active model: only applies to the API path. The CLI uses whatever
+    # `claude` is configured with, which we can't read from here.
+    active_model = get_model() if provider == "api" else ""
     return {
         "provider": provider,
         "api_key_set": bool(api_key),
         "cli_installed": bool(cli_path),
         "cli_path": cli_path or "",
         "cli_version": cli_version,
+        "active_model": active_model,
+        "model_setting": (get_setting("claude_model", "") or "").strip(),
+        "model_env": (os.getenv("CLAUDE_MODEL") or "").strip(),
+        "builtin_default_model": BUILTIN_DEFAULT_MODEL,
+        "known_models": [
+            {"id": mid, "label": label, "blurb": blurb}
+            for (mid, label, blurb) in KNOWN_MODELS
+        ],
     }
 
 
@@ -485,7 +540,7 @@ def _call_via_api(system: str | list, user: str, model: str | None,
         )
     client = Anthropic(api_key=raw)
     msg = client.messages.create(
-        model=model or DEFAULT_MODEL,
+        model=model or get_model(),
         max_tokens=max_tokens or MAX_TOKENS,
         system=system,
         messages=[{"role": "user", "content": user}],
@@ -787,6 +842,20 @@ def api_settings_clear_api_key():
 @app.put("/api/settings")
 def api_settings_put():
     payload = request.get_json(force=True)
+    # claude_model gets a light sanity check so a typo doesn't silently
+    # blow up the next AI call with an opaque 400. Empty string is allowed
+    # (means "fall back to env var / built-in default").
+    if "claude_model" in payload:
+        v = (payload["claude_model"] or "").strip()
+        if v and not is_valid_model(v):
+            return jsonify({
+                "error": (
+                    f"'{v}' doesn't look like a valid Claude model id. "
+                    "Expected something starting with 'claude-' "
+                    "(e.g. claude-sonnet-4-5)."
+                )
+            }), 400
+        payload["claude_model"] = v
     for k, v in payload.items():
         if k == "anthropic_api_key_set":
             continue
