@@ -1354,11 +1354,18 @@ $("#eng-add").addEventListener("click", () => {
   };
 });
 
+const URL_ONLY_RE = /^https?:\/\/\S+$/;
+
 $("#eng-comments").addEventListener("click", () => {
   const html = `
-    <label>Paste the LinkedIn post you want to comment on
-      <textarea id="c-target" rows="6" placeholder="Paste the full post here…"></textarea>
+    <label>Paste the <b>body text</b> of the LinkedIn post (not the URL)
+      <textarea id="c-target" rows="8"
+        placeholder="On LinkedIn, click ⋯ on the post → Copy text → paste here. URLs alone won't work — we can't fetch them."></textarea>
     </label>
+    <p class="muted tiny" style="margin: 4px 0 10px 0">
+      Comments are generated in your voice using samples from the Voice tab.
+      Add a few past posts there for best results.
+    </p>
     <div class="form-row" style="margin-top:14px">
       <button class="btn primary" id="c-go">Generate 3 comments ${'✨'}</button>
       <button class="btn" id="c-cancel">Cancel</button>
@@ -1367,12 +1374,53 @@ $("#eng-comments").addEventListener("click", () => {
   openModal("Comment generator", html);
   $("#c-cancel").onclick = closeModal;
   const goBtn = $("#c-go");
+  const out = () => $("#c-out");
+
+  function showError(msg) {
+    out().innerHTML =
+      `<div class="card" style="margin:8px 0;border-color:#b45309">
+         <b style="color:#fbbf24">Couldn't generate</b>
+         <div style="margin-top:6px;white-space:pre-wrap">${escape(msg)}</div>
+       </div>`;
+  }
+
   goBtn.onclick = withSpinner(goBtn, async () => {
-    const r = await api("/api/engagement/comments", {
-      method: "POST", body: { target_post: $("#c-target").value },
-    });
-    if (!r.ok) return toast(r.error, "error");
-    $("#c-out").innerHTML = r.comments.map(c => `
+    const target = ($("#c-target").value || "").trim();
+    if (!target) {
+      return showError("Paste the body text of the post first.");
+    }
+    if (URL_ONLY_RE.test(target)) {
+      return showError(
+        "That looks like just a URL. Cadence can't fetch LinkedIn URLs " +
+        "(LinkedIn's ToS forbids scraping). Open the post on LinkedIn, " +
+        "click ⋯ → Copy text, then paste that."
+      );
+    }
+    out().innerHTML = "";
+
+    // 60s timeout via AbortController so the spinner can't hang forever.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60_000);
+    let r;
+    try {
+      const res = await fetch("/api/engagement/comments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target_post: target }),
+        signal: controller.signal,
+      });
+      r = await res.json().catch(() => ({ ok: false, error: res.statusText }));
+    } catch (e) {
+      clearTimeout(timer);
+      const isAbort = e.name === "AbortError";
+      return showError(isAbort
+        ? "Timed out after 60 seconds. Try again, or check your AI backend in Settings."
+        : "Network error: " + e.message);
+    }
+    clearTimeout(timer);
+
+    if (!r.ok) return showError(r.error || "Unknown error.");
+    out().innerHTML = r.comments.map(c => `
       <div class="card" style="margin:8px 0">
         <div style="white-space:pre-wrap">${escape(c)}</div>
         <button class="btn sm" style="margin-top:8px"
