@@ -10,6 +10,8 @@ chaos of "what should I post next?" into a repeatable pipeline:
 Runs on your laptop. Your data lives in one SQLite file (`data/pipeline.db`).
 Nothing leaves your machine except the prompts you send to Claude.
 
+**Live site:** [nomadicmehul.github.io/cadence](https://nomadicmehul.github.io/cadence/) (project showcase, no install needed)
+
 > Built originally for one creator's workflow, now generalised so anyone can
 > drop in their own voice, pillars, and audience in 60 seconds of onboarding.
 
