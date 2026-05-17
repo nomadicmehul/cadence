@@ -1836,6 +1836,83 @@ $("#backup-file").addEventListener("change", async (e) => {
   }
 });
 
+// ---------- Markdown backup zip ----------
+$("#backup-md-export")?.addEventListener("click", async () => {
+  const btn = $("#backup-md-export");
+  await withSpinner(btn, async () => {
+    $("#backup-md-status").textContent = "packing…";
+    try {
+      const r = await fetch("/api/backup/export-markdown");
+      if (!r.ok) throw new Error(r.statusText);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = (r.headers.get("content-disposition") || "")
+        .match(/filename="([^"]+)"/)?.[1] || "cadence-backup.zip";
+      a.click();
+      URL.revokeObjectURL(url);
+      $("#backup-md-status").textContent = "downloaded";
+      toast("Markdown backup .zip downloaded", "ok");
+    } catch (err) {
+      $("#backup-md-status").textContent = "";
+      toast("Export failed: " + err.message, "error");
+    }
+  })();
+});
+
+$("#backup-md-import")?.addEventListener("click", () => {
+  $("#backup-md-file").click();
+});
+
+$("#backup-md-file")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  e.target.value = "";
+  const ok = confirm(
+    `Restore from "${file.name}"? This is ADDITIVE — pillars / sources upsert ` +
+    `by name/url, voice appends new, and every other table upserts by id. ` +
+    `Nothing is deleted. (For a full wipe-and-replace, use the JSON Restore button instead.)`
+  );
+  if (!ok) return;
+  $("#backup-md-status").textContent = "uploading…";
+  try {
+    const buf = await file.arrayBuffer();
+    // base64-encode the bytes for the JSON POST. Browsers don't have
+    // a built-in helper, so we go via a binary string + btoa.
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin);
+    const r = await api("/api/backup/import-markdown", {
+      method: "POST", body: { zip_base64: b64 },
+    });
+    if (!r.ok) {
+      $("#backup-md-status").textContent = "";
+      return toast(r.error || "Import failed", "error");
+    }
+    const bits = [];
+    if (r.drafts_inserted) bits.push(`${r.drafts_inserted} drafts +`);
+    if (r.drafts_updated) bits.push(`${r.drafts_updated} drafts updated`);
+    if (r.ideas_inserted) bits.push(`${r.ideas_inserted} ideas +`);
+    if (r.ideas_updated) bits.push(`${r.ideas_updated} ideas updated`);
+    if (r.reflections_inserted) bits.push(`${r.reflections_inserted} reflections +`);
+    if (r.analytics_inserted) bits.push(`${r.analytics_inserted} analytics +`);
+    if (r.pillars_inserted) bits.push(`${r.pillars_inserted} pillars +`);
+    if (r.voice_inserted) bits.push(`${r.voice_inserted} voice +`);
+    const summary = bits.length ? bits.join(" · ") : "nothing changed";
+    $("#backup-md-status").textContent = `✓ ${summary}`;
+    toast(`Markdown backup applied: ${summary}`, "ok");
+    if ((r.warnings || []).length) {
+      console.warn("Markdown backup warnings:", r.warnings);
+    }
+    setTimeout(() => location.reload(), 1200);
+  } catch (err) {
+    $("#backup-md-status").textContent = "";
+    toast("Import failed: " + err.message, "error");
+  }
+});
+
 // =====================================================================
 // ONBOARDING — first-run modal
 // =====================================================================

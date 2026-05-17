@@ -359,15 +359,32 @@
         exports by default — paste it again on the new machine.
       </p>
       <div class="ed-row">
-        <button class="btn primary" id="backup-export">Download backup</button>
-        <button class="btn" id="backup-import">Restore from backup…</button>
+        <button class="btn primary" id="backup-export">Download backup (JSON)</button>
+        <button class="btn" id="backup-import">Restore from JSON…</button>
         <input type="file" id="backup-file" accept="application/json,.json" hidden />
         <span class="muted tiny" id="backup-status"></span>
       </div>
+
+      <p class="muted tiny" style="margin: 14px 0 6px 0;border-top:1px solid var(--line);padding-top:14px">
+        <b>Markdown backup (.zip)</b> — same data, but each draft / idea /
+        reflection is its own readable file. Open the zip and edit any file in
+        your text editor. Import is <b>additive</b> (every table upserts by
+        id; nothing is deleted).
+      </p>
+      <div class="ed-row">
+        <button class="btn" id="backup-md-export">Download backup (.zip)</button>
+        <button class="btn" id="backup-md-import">Restore from .zip…</button>
+        <input type="file" id="backup-md-file" accept="application/zip,.zip" hidden />
+        <span class="muted tiny" id="backup-md-status"></span>
+      </div>
+
       <p class="muted tiny" style="margin-top:10px">
-        For headless / scripted use, run
-        <code>python app.py export backup.json</code> and
-        <code>python app.py import backup.json</code> from the project root.
+        Headless / scripted use:
+        <code>python app.py export backup.json</code>,
+        <code>python app.py import backup.json</code>,
+        or for the markdown archive
+        <code>python app.py backup export-md backup.zip</code>,
+        <code>python app.py backup import-md backup.zip</code>.
       </p>
     </div>
   </section>

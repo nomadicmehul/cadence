@@ -107,7 +107,44 @@ Import is **additive**: pillars and topic sources upsert by name / URL,
 voice samples append (no duplicates), nothing in the DB is deleted just
 because it's missing from the file. Use Option A for a full wipe-and-replace.
 
-### Option C — copy the SQLite file
+### Option C — full backup as a `.zip` of markdown files (human-editable)
+
+Same data as Option A, but each draft / idea / reflection is its own
+readable file in a zip. Edit individual posts in any text editor, commit
+the folder to git for version-controlled history.
+
+```bash
+# Export
+python app.py backup export-md ~/Desktop/cadence-backup.zip
+# Or click "Download backup (.zip)" in Settings → Backup & migrate
+
+# Unzip, edit any file in your text editor, re-zip
+
+# Load back
+python app.py backup import-md ~/Desktop/cadence-backup.zip
+# Or click "Restore from .zip…" in Settings → Backup & migrate
+```
+
+Archive layout:
+
+```
+cadence-backup-YYYYMMDD/
+├── profile.md            # creator profile (Option B's file)
+├── drafts/
+│   └── 0042-some-title.md
+├── ideas.md
+├── reflections.md
+├── topics.md
+├── analytics.csv         # tabular data stays tabular
+└── manifest.json         # row counts + schema_version
+```
+
+Import is **additive** like Option B but extended to the content tail:
+drafts / ideas / reflections / analytics UPSERT by their `id` field;
+pillars / sources upsert by name / URL. Nothing is deleted just because
+it's missing from the archive.
+
+### Option D — copy the SQLite file
 
 If you trust both machines and don't need the JSON-readable history:
 
