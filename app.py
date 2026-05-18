@@ -1008,6 +1008,450 @@ def api_backup_import():
 
 
 # ---------------------------------------------------------------------------
+# Profile markdown — human-editable round-trip for the creator profile
+#
+# Companion to the JSON backup, but readable in any markdown editor and
+# friendly to git diffs. Includes creator profile settings, content pillars,
+# voice samples, and topic sources. Deliberately excludes the API key
+# (credential) and content-tail tables (ideas, drafts, analytics — those
+# stay in the JSON backup).
+#
+# Import semantics are *additive / upsert*, never destructive:
+#   - settings: UPDATE keys present in the file; leave others alone
+#   - pillars:  UPSERT BY NAME — existing names update, new names insert,
+#               pillars not mentioned in the file are left alone (preserves
+#               foreign-key references from drafts/ideas/topics)
+#   - voice:    APPEND samples whose content isn't already in DB
+#               (re-importing the same file is a no-op, never duplicates)
+#   - sources:  UPSERT BY URL — same as pillars, preserves topic refs
+#
+# To wipe-and-replace, use the JSON backup with mode=replace.
+# ---------------------------------------------------------------------------
+
+
+_PROFILE_FRONTMATTER_KEYS = (
+    ("name", "creator_name"),
+    ("handle", "creator_handle"),
+    ("weekly_target", "weekly_target"),
+    ("preferred_hours", "preferred_hours"),
+    ("default_format", "default_format"),
+)
+
+
+def _gather_profile_data() -> dict:
+    """Pull current creator profile state from the DB into one dict.
+    Pure DB; no AI. Used by both export and the round-trip tests."""
+    with db_cursor() as conn:
+        pillars = [dict(r) for r in conn.execute(
+            "SELECT name, description, target_pct, color, sort_order "
+            "FROM pillars ORDER BY sort_order, id"
+        ).fetchall()]
+        voice = [dict(r) for r in conn.execute(
+            "SELECT content, label FROM voice_samples ORDER BY id"
+        ).fetchall()]
+        sources = [dict(r) for r in conn.execute(
+            "SELECT name, url, kind, enabled FROM topic_sources "
+            "ORDER BY id"
+        ).fetchall()]
+    return {
+        "name": get_setting("creator_name"),
+        "handle": get_setting("creator_handle"),
+        "bio": get_setting("creator_bio"),
+        "target_audience": get_setting("target_audience"),
+        "weekly_target": get_setting("weekly_target") or "5",
+        "preferred_hours": get_setting("preferred_hours") or "09:00,17:30",
+        "default_format": get_setting("default_format") or "story",
+        "pillars": pillars,
+        "voice_samples": voice,
+        "topic_sources": sources,
+    }
+
+
+def _profile_to_markdown(data: dict) -> str:
+    """Serialize a profile dict to markdown with YAML-style frontmatter."""
+    lines: list[str] = []
+    lines.append("---")
+    for md_key, _ in _PROFILE_FRONTMATTER_KEYS:
+        # data keys mirror md_key names (e.g. "name", "handle"). Empty
+        # values get emitted as empty so the round-trip is symmetric.
+        v = str(data.get(md_key, "") or "").strip()
+        lines.append(f"{md_key}: {v}")
+    lines.append("---")
+    lines.append("")
+    lines.append("# Cadence creator profile")
+    lines.append("")
+    lines.append(
+        f"Exported on {datetime.utcnow().strftime('%Y-%m-%d')}. Edit any "
+        "section freely, then load this file back from "
+        "Settings -> Creator profile, or `python app.py profile import "
+        "<path>`."
+    )
+    lines.append("")
+
+    bio = (data.get("bio") or "").strip()
+    lines.append("## Bio")
+    lines.append("")
+    lines.append(bio if bio else "_(empty)_")
+    lines.append("")
+
+    aud = (data.get("target_audience") or "").strip()
+    lines.append("## Target audience")
+    lines.append("")
+    lines.append(aud if aud else "_(empty)_")
+    lines.append("")
+
+    lines.append("## Pillars")
+    lines.append("")
+    if data.get("pillars"):
+        for p in data["pillars"]:
+            lines.append(f"### {p['name']}")
+            lines.append(f"- target_pct: {p.get('target_pct', 0)}")
+            lines.append(f"- color: {p.get('color', '#6366f1')}")
+            lines.append(f"- sort_order: {p.get('sort_order', 0)}")
+            lines.append("")
+            desc = (p.get("description") or "").strip()
+            lines.append(desc if desc else "_(no description)_")
+            lines.append("")
+    else:
+        lines.append("_(no pillars yet)_")
+        lines.append("")
+
+    lines.append("## Voice samples")
+    lines.append("")
+    if data.get("voice_samples"):
+        for i, s in enumerate(data["voice_samples"], 1):
+            lines.append(f"### Sample {i}")
+            lines.append(f"- label: {s.get('label', '') or ''}")
+            lines.append("")
+            lines.append((s.get("content") or "").strip())
+            lines.append("")
+    else:
+        lines.append("_(no voice samples yet)_")
+        lines.append("")
+
+    lines.append("## Topic sources")
+    lines.append("")
+    if data.get("topic_sources"):
+        for src in data["topic_sources"]:
+            lines.append(f"### {src['name']}")
+            lines.append(f"- url: {src['url']}")
+            lines.append(f"- kind: {src.get('kind', 'rss')}")
+            lines.append(f"- enabled: "
+                         f"{'true' if src.get('enabled', 1) else 'false'}")
+            lines.append("")
+    else:
+        lines.append("_(no topic sources yet)_")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _parse_profile_markdown(text: str) -> dict:
+    """Parse profile markdown back to a structured dict. Raises ValueError
+    on truly broken input (missing frontmatter delimiter, etc.); silently
+    tolerates everything else and surfaces warnings in the response."""
+    out: dict = {
+        "frontmatter": {}, "bio": "", "target_audience": "",
+        "pillars": [], "voice_samples": [], "topic_sources": [],
+        "warnings": [],
+    }
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+
+    # Frontmatter (optional but normal for round-trip files)
+    if i < n and lines[i].strip() == "---":
+        i += 1
+        while i < n and lines[i].strip() != "---":
+            line = lines[i]
+            if ":" in line:
+                k, _, v = line.partition(":")
+                out["frontmatter"][k.strip().lower()] = v.strip()
+            i += 1
+        if i < n and lines[i].strip() == "---":
+            i += 1  # skip closing ---
+
+    # Walk H2 / H3 sections.
+    current_h2 = None    # e.g. "Bio", "Pillars", ...
+    current_h3 = None    # e.g. "Industry insights" (when under Pillars/Voice/Topic)
+    current_h3_meta: dict = {}
+    current_h3_body: list[str] = []
+    h2_body: list[str] = []   # for Bio / Target audience
+
+    KNOWN_H2 = {
+        "bio": "bio",
+        "target audience": "target_audience",
+        "pillars": "pillars",
+        "voice samples": "voice_samples",
+        "topic sources": "topic_sources",
+    }
+    EMPTY_PLACEHOLDERS = {"_(empty)_", "_(no description)_",
+                          "_(no pillars yet)_", "_(no voice samples yet)_",
+                          "_(no topic sources yet)_"}
+
+    def _flush_h2():
+        nonlocal h2_body
+        if current_h2 in ("bio", "target_audience"):
+            body = "\n".join(h2_body).strip()
+            if body in EMPTY_PLACEHOLDERS:
+                body = ""
+            out[current_h2] = body
+        h2_body = []
+
+    def _flush_h3():
+        nonlocal current_h3, current_h3_meta, current_h3_body
+        if not current_h3:
+            return
+        body = "\n".join(current_h3_body).strip()
+        if body in EMPTY_PLACEHOLDERS:
+            body = ""
+        if current_h2 == "pillars":
+            out["pillars"].append({
+                "name": current_h3,
+                "description": body,
+                "target_pct": _safe_int(current_h3_meta.get("target_pct"), 20),
+                "color": current_h3_meta.get("color") or "#6366f1",
+                "sort_order": _safe_int(current_h3_meta.get("sort_order"),
+                                        len(out["pillars"]) + 1),
+            })
+        elif current_h2 == "voice_samples":
+            out["voice_samples"].append({
+                "content": body,
+                "label": current_h3_meta.get("label") or "",
+            })
+        elif current_h2 == "topic_sources":
+            url = current_h3_meta.get("url") or ""
+            if url:
+                out["topic_sources"].append({
+                    "name": current_h3,
+                    "url": url,
+                    "kind": current_h3_meta.get("kind") or "rss",
+                    "enabled": _truthy(
+                        current_h3_meta.get("enabled", "true")),
+                })
+            else:
+                out["warnings"].append(
+                    f"Topic source '{current_h3}' has no `- url:` line; "
+                    "skipped."
+                )
+        current_h3 = None
+        current_h3_meta = {}
+        current_h3_body = []
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        # H1 — title; ignore
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            i += 1
+            continue
+        # H2
+        if stripped.startswith("## "):
+            _flush_h3()
+            _flush_h2()
+            heading = stripped[3:].strip().lower()
+            current_h2 = KNOWN_H2.get(heading)
+            if not current_h2:
+                out["warnings"].append(
+                    f"Unknown section '## {stripped[3:].strip()}' (ignored)."
+                )
+            i += 1
+            continue
+        # H3 (only meaningful under list sections)
+        if stripped.startswith("### ") and current_h2 in (
+            "pillars", "voice_samples", "topic_sources"
+        ):
+            _flush_h3()
+            current_h3 = stripped[4:].strip()
+            current_h3_meta = {}
+            current_h3_body = []
+            i += 1
+            continue
+        # Bullet metadata `- key: value` immediately under an H3
+        if (current_h3 and stripped.startswith("- ")
+                and ":" in stripped):
+            k, _, v = stripped[2:].partition(":")
+            current_h3_meta[k.strip().lower()] = v.strip()
+            i += 1
+            continue
+        # Otherwise: content row
+        if current_h3:
+            current_h3_body.append(line)
+        elif current_h2 in ("bio", "target_audience"):
+            h2_body.append(line)
+        i += 1
+
+    _flush_h3()
+    _flush_h2()
+    return out
+
+
+def _truthy(v) -> int:
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return 1 if v else 0
+    s = str(v or "").strip().lower()
+    if s in ("true", "yes", "1", "on", "enabled"):
+        return 1
+    return 0
+
+
+def _safe_int(v, fallback: int) -> int:
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _apply_profile_dict(parsed: dict) -> dict:
+    """Apply a parsed profile dict to the DB. Additive, never deletes
+    rows not mentioned. Returns counts so the UI / CLI can report what
+    happened."""
+    counts = {
+        "settings_updated": 0,
+        "pillars_inserted": 0, "pillars_updated": 0,
+        "voice_inserted": 0, "voice_skipped_duplicates": 0,
+        "sources_inserted": 0, "sources_updated": 0,
+        "warnings": list(parsed.get("warnings") or []),
+    }
+
+    fm = parsed.get("frontmatter") or {}
+
+    # Settings from frontmatter
+    for md_key, setting_key in _PROFILE_FRONTMATTER_KEYS:
+        if md_key in fm:
+            v = fm[md_key]
+            if setting_key == "default_format":
+                allowed = {"story", "list", "contrarian", "tutorial",
+                           "carousel", "bts"}
+                if v not in allowed:
+                    counts["warnings"].append(
+                        f"Ignoring default_format='{v}' (not one of "
+                        f"{sorted(allowed)})."
+                    )
+                    continue
+            if setting_key == "weekly_target":
+                n = _safe_int(v, -1)
+                if n < 1 or n > 14:
+                    counts["warnings"].append(
+                        f"Ignoring weekly_target='{v}' (out of 1-14)."
+                    )
+                    continue
+                v = str(n)
+            set_setting(setting_key, v)
+            counts["settings_updated"] += 1
+
+    # Bio and target_audience from H2 body sections
+    if parsed.get("bio"):
+        set_setting("creator_bio", parsed["bio"])
+        counts["settings_updated"] += 1
+    if parsed.get("target_audience"):
+        set_setting("target_audience", parsed["target_audience"])
+        counts["settings_updated"] += 1
+
+    with db_cursor() as conn:
+        # Pillars: UPSERT BY NAME. Don't delete unmatched (drafts/ideas
+        # reference these via FK ON DELETE SET NULL).
+        for p in parsed.get("pillars") or []:
+            existing = conn.execute(
+                "SELECT id FROM pillars WHERE name=?", (p["name"],)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE pillars SET description=?, target_pct=?, "
+                    "color=?, sort_order=? WHERE id=?",
+                    (p["description"], p["target_pct"], p["color"],
+                     p["sort_order"], existing["id"]),
+                )
+                counts["pillars_updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO pillars(name, description, target_pct, "
+                    "color, sort_order) VALUES (?, ?, ?, ?, ?)",
+                    (p["name"], p["description"], p["target_pct"],
+                     p["color"], p["sort_order"]),
+                )
+                counts["pillars_inserted"] += 1
+
+        # Voice: APPEND samples whose content isn't already present.
+        # Match on exact content (after strip). This makes re-import a no-op.
+        existing_voice = {
+            (r["content"] or "").strip()
+            for r in conn.execute(
+                "SELECT content FROM voice_samples"
+            ).fetchall()
+        }
+        for s in parsed.get("voice_samples") or []:
+            content = (s.get("content") or "").strip()
+            if not content:
+                continue
+            if content in existing_voice:
+                counts["voice_skipped_duplicates"] += 1
+                continue
+            conn.execute(
+                "INSERT INTO voice_samples(content, label) VALUES (?, ?)",
+                (content, s.get("label") or ""),
+            )
+            existing_voice.add(content)
+            counts["voice_inserted"] += 1
+
+        # Topic sources: UPSERT BY URL. Don't delete unmatched (topics
+        # reference source_id via FK ON DELETE CASCADE — wiping would
+        # cascade-delete ingested headlines).
+        for src in parsed.get("topic_sources") or []:
+            existing = conn.execute(
+                "SELECT id FROM topic_sources WHERE url=?", (src["url"],)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE topic_sources SET name=?, kind=?, enabled=? "
+                    "WHERE id=?",
+                    (src["name"], src["kind"], src["enabled"],
+                     existing["id"]),
+                )
+                counts["sources_updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO topic_sources(name, url, kind, enabled) "
+                    "VALUES (?, ?, ?, ?)",
+                    (src["name"], src["url"], src["kind"], src["enabled"]),
+                )
+                counts["sources_inserted"] += 1
+
+    return counts
+
+
+@app.get("/api/profile/export")
+def api_profile_export():
+    data = _gather_profile_data()
+    md = _profile_to_markdown(data)
+    fname = f"cadence-profile-{datetime.utcnow().strftime('%Y%m%d')}.md"
+    return (
+        md,
+        200,
+        {
+            "Content-Type": "text/markdown; charset=utf-8",
+            "Content-Disposition": f'attachment; filename="{fname}"',
+        },
+    )
+
+
+@app.post("/api/profile/import")
+def api_profile_import():
+    body = request.get_json(force=True)
+    md = body.get("markdown", "")
+    if not isinstance(md, str) or not md.strip():
+        return jsonify({"error": "markdown must be a non-empty string"}), 400
+    try:
+        parsed = _parse_profile_markdown(md)
+        counts = _apply_profile_dict(parsed)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, **counts})
+
+
+# ---------------------------------------------------------------------------
 # Routes — pillars
 # ---------------------------------------------------------------------------
 
@@ -3252,6 +3696,38 @@ def _cli_import(path: str, *, mode: str, yes: bool) -> int:
     return 0
 
 
+def _cli_profile_export(path: str) -> int:
+    data = _gather_profile_data()
+    md = _profile_to_markdown(data)
+    Path(path).write_text(md, encoding="utf-8")
+    print(f"Exported profile to {path}")
+    print(f"  pillars:        {len(data['pillars'])}")
+    print(f"  voice samples:  {len(data['voice_samples'])}")
+    print(f"  topic sources:  {len(data['topic_sources'])}")
+    return 0
+
+
+def _cli_profile_import(path: str) -> int:
+    p = Path(path)
+    if not p.exists():
+        print(f"File not found: {path}", file=sys.stderr)
+        return 2
+    try:
+        parsed = _parse_profile_markdown(p.read_text(encoding="utf-8"))
+        counts = _apply_profile_dict(parsed)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    print(f"Imported profile from {path}.")
+    for k, v in counts.items():
+        if k == "warnings":
+            continue
+        print(f"  {k}: {v}")
+    for w in counts.get("warnings") or []:
+        print(f"  warning: {w}")
+    return 0
+
+
 def _build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Cadence — run the server, or back up / restore your data.",
@@ -3284,6 +3760,23 @@ def _build_cli() -> argparse.ArgumentParser:
         help="Lookback window in days (default: 7).",
     )
 
+    p_profile = sub.add_parser(
+        "profile",
+        help="Export / import the creator profile (settings, pillars, voice, "
+             "topic sources) as a human-editable markdown file.",
+    )
+    p_profile_sub = p_profile.add_subparsers(dest="profile_cmd")
+    p_pe = p_profile_sub.add_parser(
+        "export", help="Save current profile to a profile.md file."
+    )
+    p_pe.add_argument("path", help="Output path (e.g. profile.md)")
+    p_pi = p_profile_sub.add_parser(
+        "import",
+        help="Load a profile.md back. Additive: pillars/sources upsert by "
+             "name/url; voice appends new; nothing is deleted.",
+    )
+    p_pi.add_argument("path", help="Input markdown path")
+
     sub.add_parser("serve", help="Start the web server (default).")
     return parser
 
@@ -3297,6 +3790,14 @@ if __name__ == "__main__":
         sys.exit(_cli_import(args.path, mode=args.mode, yes=args.yes))
     if args.cmd == "reflect":
         sys.exit(_cli_reflect(window_days=max(1, min(args.days, 90))))
+    if args.cmd == "profile":
+        if args.profile_cmd == "export":
+            sys.exit(_cli_profile_export(args.path))
+        if args.profile_cmd == "import":
+            sys.exit(_cli_profile_import(args.path))
+        # No subcommand given — print help
+        parser.parse_args(["profile", "--help"])
+        sys.exit(2)
     # Default: serve
     port = int(os.getenv("PORT", "5050"))
     print(f"\n  Cadence running at http://127.0.0.1:{port}\n")

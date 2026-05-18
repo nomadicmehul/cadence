@@ -1794,6 +1794,67 @@ $("#pillar-add").addEventListener("click", async () => {
   loadSettings();
 });
 
+// ---------- profile.md export / import ----------
+$("#profile-md-export")?.addEventListener("click", async () => {
+  // Use fetch directly so we can grab the Content-Disposition filename
+  // the backend sets, instead of constructing one client-side.
+  const r = await fetch("/api/profile/export");
+  if (!r.ok) return toast("Export failed", "error");
+  const text = await r.text();
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = (r.headers.get("content-disposition") || "")
+    .match(/filename="([^"]+)"/)?.[1] || "profile.md";
+  a.click();
+  URL.revokeObjectURL(url);
+  toast("profile.md downloaded", "ok");
+});
+
+$("#profile-md-import")?.addEventListener("click", () => {
+  $("#profile-md-file").click();
+});
+
+$("#profile-md-file")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  $("#profile-md-status").textContent = "Loading…";
+  try {
+    const md = await file.text();
+    const r = await api("/api/profile/import", {
+      method: "POST", body: { markdown: md },
+    });
+    if (!r.ok) {
+      $("#profile-md-status").textContent = `Error: ${r.error || "unknown"}`;
+      return toast(r.error || "Import failed", "error");
+    }
+    const bits = [];
+    if (r.settings_updated) bits.push(`${r.settings_updated} setting${r.settings_updated === 1 ? "" : "s"}`);
+    if (r.pillars_inserted) bits.push(`${r.pillars_inserted} new pillar${r.pillars_inserted === 1 ? "" : "s"}`);
+    if (r.pillars_updated) bits.push(`${r.pillars_updated} pillar${r.pillars_updated === 1 ? "" : "s"} updated`);
+    if (r.voice_inserted) bits.push(`${r.voice_inserted} voice sample${r.voice_inserted === 1 ? "" : "s"}`);
+    if (r.voice_skipped_duplicates) bits.push(`${r.voice_skipped_duplicates} voice dup${r.voice_skipped_duplicates === 1 ? "" : "s"} skipped`);
+    if (r.sources_inserted) bits.push(`${r.sources_inserted} new source${r.sources_inserted === 1 ? "" : "s"}`);
+    if (r.sources_updated) bits.push(`${r.sources_updated} source${r.sources_updated === 1 ? "" : "s"} updated`);
+    const summary = bits.length ? bits.join(" · ") : "nothing changed";
+    $("#profile-md-status").textContent = `✓ ${summary}`;
+    toast(`profile.md applied: ${summary}`, "ok");
+    if ((r.warnings || []).length) {
+      console.warn("Profile import warnings:", r.warnings);
+    }
+    // Reload Settings to reflect updated values
+    loadSettings();
+    refreshBrand();
+  } catch (err) {
+    $("#profile-md-status").textContent = `Error: ${err.message}`;
+    toast(err.message, "error");
+  } finally {
+    // Reset so picking the same file again re-fires the change event
+    e.target.value = "";
+  }
+});
+
 // =====================================================================
 // BACKUP / RESTORE
 // =====================================================================

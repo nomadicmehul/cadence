@@ -336,6 +336,47 @@ The user has real data — never delete `data/pipeline.db`. If you need a clean
 slate for testing, use the `tests/conftest.py` fixture pattern (per-test
 temp DB).
 
+### profile.md (human-editable export/import)
+
+Companion to the JSON backup, but readable in any markdown editor and
+friendly to git diffs. Contains: creator profile settings (name, handle,
+bio, target_audience, weekly_target, preferred_hours, default_format),
+content pillars, voice samples, and topic sources. Deliberately
+**excludes** the API key (credential — stays redacted, like the JSON
+backup) and the content tail (ideas, drafts, analytics, reflections,
+topics — those live in JSON backup only).
+
+Three surfaces, same `_profile_to_markdown` / `_parse_profile_markdown` /
+`_apply_profile_dict` core:
+
+- **CLI**: `python app.py profile export profile.md` / `profile import profile.md`
+- **HTTP**: `GET /api/profile/export` / `POST /api/profile/import {markdown: "..."}`
+- **UI**: Settings → Creator profile → **Save to profile.md** / **Load from file**
+
+Format: YAML-style frontmatter for short scalars, `##` H2 sections for
+prose (Bio, Target audience), `##` H2 + `###` H3 sub-items with
+bulleted metadata + body for list types (Pillars, Voice samples,
+Topic sources).
+
+**Import semantics — additive, never destructive.** This is load-bearing
+and a future agent should NOT "simplify" it to a clean-slate replace:
+
+- settings: UPDATE keys present in the file; leave others
+- pillars: UPSERT BY NAME; pillars in DB but not in the file are left
+  alone (preserves foreign-key references from drafts / ideas / topics
+  via ON DELETE SET NULL)
+- voice: APPEND samples whose content isn't already in DB; re-importing
+  the same file is a no-op
+- topic sources: UPSERT BY URL; sources in DB but not in the file are
+  left alone (topics.source_id is ON DELETE CASCADE, so deleting a
+  source would wipe its ingested headlines)
+
+To wipe-and-replace, use the JSON backup with `mode=replace`.
+
+Empty-section placeholders (`_(empty)_`, `_(no description)_`, etc.) are
+recognised on parse and treated as empty strings — they never overwrite
+existing values with the literal placeholder text.
+
 ---
 
 ## CSV / XLSX import (the trickiest code in the repo)
@@ -618,6 +659,9 @@ POST              /api/topics/{id}/draft    # Claude turns the topic into an ang
 
 GET  /api/backup/export             # download full DB as JSON (?redact=0 keeps API key)
 POST /api/backup/import             # body {payload, mode: 'replace'|'merge'}
+
+GET  /api/profile/export            # download creator profile as profile.md
+POST /api/profile/import            # body {markdown: "..."} — additive, never deletes
 
 GET/POST/PUT/DELETE /api/pillars
 GET/POST/PUT/DELETE /api/ideas

@@ -86,7 +86,28 @@ python app.py import ~/Desktop/cadence-backup.json
 Or use the UI: **Settings → Backup & migrate → Restore from backup**, pick
 the JSON file. Confirms with a "this wipes current data" prompt, then reloads.
 
-### Option B — copy the SQLite file
+### Option B — `profile.md` (just the creator profile, human-editable)
+
+For your settings, content pillars, voice samples, and topic sources — a
+markdown file is friendlier to version-control and edit in any text editor.
+
+```bash
+# Export
+python app.py profile export ~/Desktop/profile.md
+# Or click "Save to profile.md" in Settings → Creator profile
+
+# Edit freely — plain markdown with YAML-style frontmatter
+
+# Load back
+python app.py profile import ~/Desktop/profile.md
+# Or click "Load from file…" in Settings → Creator profile
+```
+
+Import is **additive**: pillars and topic sources upsert by name / URL,
+voice samples append (no duplicates), nothing in the DB is deleted just
+because it's missing from the file. Use Option A for a full wipe-and-replace.
+
+### Option C — copy the SQLite file
 
 If you trust both machines and don't need the JSON-readable history:
 

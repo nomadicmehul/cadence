@@ -329,7 +329,19 @@
           </select>
         </label>
       </div>
-      <button class="btn primary" id="save-profile">Save profile</button>
+      <div class="ed-row" style="gap:8px;flex-wrap:wrap">
+        <button class="btn primary" id="save-profile">Save profile</button>
+        <button class="btn" id="profile-md-export">Save to profile.md</button>
+        <button class="btn" id="profile-md-import">Load from file…</button>
+        <input type="file" id="profile-md-file" accept=".md,text/markdown,text/plain" hidden />
+        <span class="muted tiny" id="profile-md-status"></span>
+      </div>
+      <p class="muted tiny" style="margin:6px 0 0 0">
+        profile.md is human-editable and contains your settings, pillars,
+        voice samples, and topic sources. Load is <b>additive</b>:
+        pillars and sources upsert by name/URL, voice appends new, nothing
+        is deleted. Use Backup &amp; migrate below for a full wipe-and-replace.
+      </p>
     </div>
 
     <div class="card">
