@@ -2556,24 +2556,72 @@ def api_analytics_import_preview():
     headers_raw = rows[0]
     headers = [(h or "").strip().lower() for h in headers_raw]
 
-    def find_col(*candidates: str) -> int:
+    # LinkedIn's "Top posts" sheet sometimes contains TWO side-by-side
+    # subtables: e.g. cols A-C = "Post URL · Date · Engagements" (top by
+    # engagement), cols E-G = "Post URL · Date · Impressions" (top by
+    # impressions). Same posts, different rankings, separated by a blank
+    # column. We detect this by counting URL-like headers; if there's more
+    # than one, we parse each subtable independently and merge by URL.
+    url_idx_positions = [
+        i for i, h in enumerate(headers)
+        if ("url" in h or "link" in h) and "engagement" not in h
+    ]
+    subtable_ranges: list[tuple[int, int]] = []
+    if len(url_idx_positions) >= 2:
+        for k, start in enumerate(url_idx_positions):
+            end = (url_idx_positions[k + 1]
+                   if k + 1 < len(url_idx_positions)
+                   else len(headers))
+            subtable_ranges.append((start, end))
+    else:
+        subtable_ranges.append((0, len(headers)))
+
+    def find_col_in(slice_headers: list[str], *candidates: str) -> int:
+        """Find the first column index (relative to the full row) whose
+        lowercased header contains any candidate keyword. Returns -1 on miss."""
+        offset, sub = slice_headers[0], slice_headers[1]
         for cand in candidates:
-            for i, h in enumerate(headers):
+            for j, h in enumerate(sub):
                 if cand in h:
-                    return i
+                    return offset + j
         return -1
 
-    col = {
-        "date":     find_col("date", "created", "posted", "publish"),
-        "impr":     find_col("impression", "view"),
-        "likes":    find_col("reaction", "like"),
-        "comments": find_col("comment"),
-        "reposts":  find_col("repost", "share"),
-        "follows":  find_col("follow"),
-        "url":      find_col("url", "link"),
-        "text":     find_col("post text", "post title", "caption",
-                             "message", "content", "body", "text"),
-    }
+    def detect_cols(start: int, end: int) -> dict:
+        """Detect column indices within a [start, end) header slice. Returns
+        the same shape `col` used to live in, but anchored to the subtable."""
+        sub_headers = headers[start:end]
+        sh = (start, sub_headers)
+        # 'engagements' is LinkedIn's aggregate column (likes+comments+reposts
+        # combined). When the export omits the breakdown, we map it to likes
+        # so the value isn't silently lost. The /preview response flags this
+        # so the UI can show a hint.
+        likes_col = find_col_in(sh, "reaction", "like")
+        engagement_col = find_col_in(sh, "engagement")
+        used_aggregate = False
+        if likes_col == -1 and engagement_col != -1:
+            likes_col = engagement_col
+            used_aggregate = True
+        return {
+            "date":     find_col_in(sh, "date", "created", "posted", "publish"),
+            "impr":     find_col_in(sh, "impression", "view"),
+            "likes":    likes_col,
+            "comments": find_col_in(sh, "comment"),
+            "reposts":  find_col_in(sh, "repost", "share"),
+            "follows":  find_col_in(sh, "follow"),
+            "url":      find_col_in(sh, "url", "link"),
+            "text":     find_col_in(sh, "post text", "post title", "caption",
+                                    "message", "content", "body"),
+            "_used_engagement_aggregate": used_aggregate,
+        }
+
+    subtable_cols = [detect_cols(s, e) for (s, e) in subtable_ranges]
+
+    # The first subtable's columns are the "primary" detected shape we expose
+    # to the UI. Aggregate-engagement flag wins if any subtable used it.
+    col = dict(subtable_cols[0])
+    used_engagement_aggregate = any(
+        c.get("_used_engagement_aggregate") for c in subtable_cols
+    )
 
     with db_cursor() as conn:
         drafts = conn.execute(
@@ -2607,20 +2655,89 @@ def api_analytics_import_preview():
         except ValueError:
             return None
 
+    # Parse each subtable separately. Each subtable contributes a partial
+    # record per row; we merge across subtables keyed by URL afterward so the
+    # engagement count from subtable 1 and the impressions from subtable 2
+    # land on the same record (rather than on whatever post happens to share
+    # a row index between the two rankings).
+    def g_of(row, idx: int) -> str:
+        return (row[idx] or "").strip() if 0 <= idx < len(row) else ""
+
+    METRIC_KEYS = ("impressions", "likes", "comments", "reposts", "follows")
+
+    by_url: dict[str, dict] = {}
+    ordered_urls: list[str] = []
+    unkeyed: list[dict] = []  # rows that had no URL — emit at the end
+
+    for sub_col in subtable_cols:
+        for row in rows[1:]:
+            url = g_of(row, sub_col["url"])
+            date = g_of(row, sub_col["date"])
+            snippet = g_of(row, sub_col["text"])[:120]
+            contrib = {
+                "impressions": to_int(g_of(row, sub_col["impr"])),
+                "likes":       to_int(g_of(row, sub_col["likes"])),
+                "comments":    to_int(g_of(row, sub_col["comments"])),
+                "reposts":     to_int(g_of(row, sub_col["reposts"])),
+                "follows":     to_int(g_of(row, sub_col["follows"])),
+            }
+            if not url and not any(contrib.values()) and not date:
+                continue  # empty row, ignore
+            if not url:
+                # Unkeyable row from this subtable; we can't merge it safely.
+                # Keep it standalone so the user sees something rather than
+                # losing the data.
+                unkeyed.append({
+                    "date": date, "snippet": snippet, "url": "",
+                    **contrib,
+                })
+                continue
+            existing = by_url.get(url)
+            if existing is None:
+                by_url[url] = {
+                    "url": url, "date": date, "snippet": snippet,
+                    **contrib,
+                }
+                ordered_urls.append(url)
+            else:
+                # Merge: take whichever value is non-zero per metric, prefer
+                # newer (the subtable being processed). Existing date/snippet
+                # are kept unless missing.
+                if not existing.get("date") and date:
+                    existing["date"] = date
+                if not existing.get("snippet") and snippet:
+                    existing["snippet"] = snippet
+                for k in METRIC_KEYS:
+                    if not existing.get(k) and contrib.get(k):
+                        existing[k] = contrib[k]
+
     parsed: list[dict] = []
-    for i, row in enumerate(rows[1:]):
-        def g(idx: int) -> str:
-            return (row[idx] or "").strip() if 0 <= idx < len(row) else ""
+    for i, url in enumerate(ordered_urls):
+        rec = by_url[url]
         parsed.append({
             "row_idx": i,
-            "date": g(col["date"]),
-            "snippet": g(col["text"])[:120],
-            "url": g(col["url"]),
-            "impressions": to_int(g(col["impr"])),
-            "likes":       to_int(g(col["likes"])),
-            "comments":    to_int(g(col["comments"])),
-            "reposts":     to_int(g(col["reposts"])),
-            "follows":     to_int(g(col["follows"])),
+            "date": rec["date"],
+            "snippet": rec["snippet"],
+            "url": rec["url"],
+            "impressions": rec["impressions"],
+            "likes":       rec["likes"],
+            "comments":    rec["comments"],
+            "reposts":     rec["reposts"],
+            "follows":     rec["follows"],
+            "matched_draft_id": None,
+            "match_reason": "",
+        })
+    for j, rec in enumerate(unkeyed):
+        parsed.append({
+            "row_idx": len(parsed) + j,
+            "date": rec["date"],
+            "snippet": rec["snippet"],
+            "url": "",
+            "impressions": rec["impressions"],
+            "likes":       rec["likes"],
+            "comments":    rec["comments"],
+            "reposts":     rec["reposts"],
+            "follows":     rec["follows"],
             "matched_draft_id": None,
             "match_reason": "",
         })
@@ -2674,6 +2791,21 @@ def api_analytics_import_preview():
         for s in sheets_meta
     ] if sheets_meta else []
 
+    notes: list[str] = []
+    if used_engagement_aggregate:
+        notes.append(
+            "LinkedIn's export didn't break engagement into likes/comments/"
+            "reposts. We mapped the aggregate 'Engagements' column to likes "
+            "so the value isn't lost. You can edit individual rows after "
+            "import to redistribute."
+        )
+    if len(subtable_ranges) > 1:
+        notes.append(
+            f"Detected {len(subtable_ranges)} side-by-side subtables in the "
+            "chosen sheet. Posts were merged by URL across them so the "
+            "impressions / engagement counts land on the same row."
+        )
+
     return jsonify({
         "ok": True,
         "headers": headers_raw,
@@ -2682,6 +2814,9 @@ def api_analytics_import_preview():
         "sheet_used": chosen_sheet,
         "sheets_available": sheets_available,
         "sheets_preview": sheets_preview,
+        "notes": notes,
+        "used_engagement_aggregate": used_engagement_aggregate,
+        "subtable_count": len(subtable_ranges),
         "drafts": [
             {"id": d["id"], "title": d["title"] or "",
              "preview": (d["body"] or "")[:80], "status": d["status"]}
@@ -2690,24 +2825,106 @@ def api_analytics_import_preview():
     })
 
 
+def _title_from_import_row(r: dict) -> str:
+    """Best-effort title for an auto-created historical draft. Order of
+    preference: an explicit title on the row, the snippet (first 60 chars),
+    or 'Imported post · <date>'. Activity-ID URLs don't carry post text
+    so we have no body to mine."""
+    explicit = (r.get("title") or "").strip()
+    if explicit:
+        return explicit[:200]
+    snippet = (r.get("snippet") or "").strip()
+    if snippet:
+        return snippet[:60]
+    date = (r.get("date") or "").strip()
+    if date:
+        return f"Imported post · {date}"
+    return "Imported post"
+
+
+def _parse_iso_for_posted_at(s: str) -> str | None:
+    """Same date parser as in /import-preview, returns ISO string or None."""
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(s[:25].split("T")[0], fmt).isoformat(
+                timespec="seconds"
+            )
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s[:25]).isoformat(timespec="seconds")
+    except ValueError:
+        return None
+
+
+CREATE_NEW_SENTINEL = "__new__"
+
+
 @app.post("/api/analytics/import-commit")
 def api_analytics_import_commit():
-    """Insert the user-confirmed rows. Skips any row without a draft_id."""
+    """Insert the user-confirmed rows.
+
+    draft_id semantics:
+      - integer / numeric string  -> attach analytics to that existing draft
+      - "__new__"                  -> create a fresh draft and attach
+      - falsy / missing            -> skip this row (the user picked "skip")
+
+    Historical-bulk-import workflow: when the user is on-boarding their
+    existing LinkedIn analytics, none of the rows have an in-Cadence draft
+    to match against. The "__new__" path creates a published-status draft
+    using the URL + date so the analytics row has a home and future
+    winners_block() queries can use the engagement signal.
+    """
     payload = request.get_json(force=True)
     rows = payload.get("rows", [])
     created = 0
     skipped = 0
+    new_drafts: list[int] = []
     with db_cursor() as conn:
         for r in rows:
-            did = r.get("draft_id")
-            if not did:
+            did_raw = r.get("draft_id")
+            did: int | None = None
+            if did_raw == CREATE_NEW_SENTINEL:
+                # Create the placeholder draft, then attach the row.
+                # Body stays empty because LinkedIn URN URLs don't include
+                # the post text. The user can paste body text later for
+                # any post they want to mine for voice training.
+                posted_at = (_parse_iso_for_posted_at(r.get("date") or "")
+                             or datetime.utcnow().isoformat(timespec="seconds"))
+                cur = conn.execute(
+                    "INSERT INTO drafts(idea_id, pillar_id, title, body, "
+                    "format, status, posted_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        None, None,
+                        _title_from_import_row(r),
+                        (r.get("url") or "")[:1000],  # URL goes in body as
+                                                      # a backreference
+                        "story",
+                        "published",
+                        posted_at,
+                    ),
+                )
+                did = cur.lastrowid
+                new_drafts.append(did)
+            elif did_raw:
+                try:
+                    did = int(did_raw)
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+            else:
                 skipped += 1
                 continue
+
             conn.execute(
                 "INSERT INTO analytics(draft_id, impressions, likes, comments, "
                 "reposts, follows) VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    int(did),
+                    did,
                     int(r.get("impressions", 0) or 0),
                     int(r.get("likes", 0) or 0),
                     int(r.get("comments", 0) or 0),
@@ -2715,13 +2932,22 @@ def api_analytics_import_commit():
                     int(r.get("follows", 0) or 0),
                 ),
             )
-            conn.execute(
-                "UPDATE drafts SET status='published', "
-                "posted_at = COALESCE(posted_at, CURRENT_TIMESTAMP) WHERE id=?",
-                (int(did),),
-            )
+            # Only flip status / set posted_at for drafts we didn't just
+            # create (new ones already have status='published').
+            if did_raw != CREATE_NEW_SENTINEL:
+                conn.execute(
+                    "UPDATE drafts SET status='published', "
+                    "posted_at = COALESCE(posted_at, CURRENT_TIMESTAMP) "
+                    "WHERE id=?",
+                    (did,),
+                )
             created += 1
-    return jsonify({"ok": True, "created": created, "skipped": skipped})
+    return jsonify({
+        "ok": True,
+        "created": created,
+        "skipped": skipped,
+        "new_drafts": new_drafts,
+    })
 
 
 @app.get("/api/analytics/insights")

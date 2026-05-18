@@ -369,6 +369,52 @@ every sheet appears to have 1 row. **Don't use `read_only=True`.** Iterate
 explicitly via `ws.cell(row, column)` over `ws.max_row × ws.max_column`. See
 `_xlsx_read_all_sheets()`.
 
+### Critical gotcha: side-by-side subtables on "Top posts"
+
+LinkedIn's *Top posts* sheet often contains TWO independent tables laid
+out side-by-side, separated by a blank column. For example:
+
+```
+Cols A-C: Post URL | Date | Engagements      (sorted by engagement rank)
+Col  D:   (blank divider)
+Cols E-G: Post URL | Date | Impressions      (sorted by impression rank)
+```
+
+The same post appears in both tables but at **different row positions**
+because the sort orders differ. A naive parser treats this as one wide
+table and ends up combining the URL from row N of the left table with the
+impressions from row N of the right table — i.e. metrics on the wrong
+posts.
+
+The fix in `api_analytics_import_preview` detects this by counting URL-like
+column headers. If two or more URL columns are present, the parser splits
+the row range into subtables, parses each, and merges by URL. See
+`url_idx_positions` + `subtable_ranges` + the `by_url` merge loop. A
+`subtable_count` field appears in the preview response, and the UI shows
+a small note when merge happened so the user understands what we did.
+
+### Engagement aggregate fallback
+
+Some LinkedIn export periods only expose an `Engagements` aggregate column
+on the *Top posts* sheet — no separate likes/comments/reposts breakdown.
+When `find_col_in` returns -1 for likes but `engagement` is present, we
+map the aggregate into the `likes` slot so the value isn't silently
+dropped. The `/import-preview` response sets
+`used_engagement_aggregate: true` and includes a note for the UI to
+display. The user can manually redistribute the number across
+likes/comments/reposts after import if they want accuracy.
+
+### Historical bulk import (`draft_id="__new__"`)
+
+When the user is onboarding their existing LinkedIn history, the
+`drafts` table is empty so zero rows auto-match. The UI defaults every
+row to "+ Create new draft" and `api_analytics_import_commit` accepts
+the sentinel `draft_id="__new__"`: it inserts a placeholder draft with
+`status='published'`, `posted_at=<row date>`, body=`<URL>` (so the user
+can still trace the post on LinkedIn), then attaches the analytics row.
+LinkedIn URN URLs don't carry post text so body is the URL string;
+users can paste text in later for posts they want to mine for voice.
+
 ### Column keyword sets
 
 Add new column variants here when LinkedIn changes export format:
@@ -383,7 +429,7 @@ col = {
     "follows":  find_col("follow"),
     "url":      find_col("url", "link"),
     "text":     find_col("post text", "post title", "caption",
-                         "message", "content", "body", "text"),
+                         "message", "content", "body"),
 }
 ```
 
