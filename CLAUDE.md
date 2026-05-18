@@ -377,6 +377,44 @@ Empty-section placeholders (`_(empty)_`, `_(no description)_`, etc.) are
 recognised on parse and treated as empty strings — they never overwrite
 existing values with the literal placeholder text.
 
+### Markdown backup .zip (full archive)
+
+Extends the profile.md idea to the whole DB. A `.zip` containing
+`profile.md`, `drafts/NNNN-slug.md` (one file per draft), `ideas.md`,
+`reflections.md`, `topics.md`, `analytics.csv`, and a `manifest.json`
+with row counts and `schema_version`. Companion to the JSON backup;
+human-readable and git-friendly, but never the canonical source of
+truth (that's still `data/pipeline.db`).
+
+Three surfaces:
+- **CLI**: `python app.py backup export-md backup.zip` / `backup import-md backup.zip`
+- **HTTP**: `GET /api/backup/export-markdown` / `POST /api/backup/import-markdown` (body: `{zip_base64: "..."}`)
+- **UI**: Settings → Backup & migrate → **Download backup (.zip)** / **Restore from .zip**
+
+Identity for round-trip:
+- drafts / ideas / reflections / analytics: **UPSERT BY id** (frontmatter
+  `id:` field for the .md files, CSV `id` column for analytics). Editing a
+  file and re-importing UPDATES the row, doesn't create a duplicate.
+- pillars / topic_sources: same name / url upsert as profile.md.
+- voice samples: same content-hash dedup as profile.md.
+
+**Import is additive, never destructive.** Re-importing an archive after
+adding new rows to the DB does NOT delete those new rows. To wipe and
+replace, use the JSON backup with `mode=replace`.
+
+Draft body safety: each draft .md uses frontmatter for all metadata,
+then reads body verbatim to end-of-file. Markdown headings INSIDE a
+draft body (`## Step 1` in a tutorial post) never confuse the parser
+because we don't section-split the body. See
+`tests/test_backup_markdown.py::test_draft_with_markdown_headings_in_body_roundtrips`.
+
+Analytics is CSV not markdown — tabular numeric data doesn't markdown
+well. The CSV columns match the `analytics` table 1:1, including the
+`id` column which carries the UPSERT identity.
+
+The `manifest.json` carries `schema_version`. Imports refuse archives
+from a newer schema than the running app.
+
 ---
 
 ## CSV / XLSX import (the trickiest code in the repo)
@@ -662,6 +700,9 @@ POST /api/backup/import             # body {payload, mode: 'replace'|'merge'}
 
 GET  /api/profile/export            # download creator profile as profile.md
 POST /api/profile/import            # body {markdown: "..."} — additive, never deletes
+
+GET  /api/backup/export-markdown    # download full DB as .zip of markdown files
+POST /api/backup/import-markdown    # body {zip_base64: "..."} — additive UPSERT BY ID
 
 GET/POST/PUT/DELETE /api/pillars
 GET/POST/PUT/DELETE /api/ideas

@@ -1452,6 +1452,849 @@ def api_profile_import():
 
 
 # ---------------------------------------------------------------------------
+# Markdown backup — human-editable full archive (.zip)
+#
+# Companion to the JSON backup. Same data, but laid out as a folder of
+# markdown files so each draft / idea / reflection is one diff in git.
+# Analytics stays as CSV (tabular numbers don't markdown well).
+#
+# Archive layout:
+#   cadence-backup-YYYYMMDD/
+#   ├── profile.md              # creator profile (same format as profile.md)
+#   ├── drafts/
+#   │   └── NNNN-slug.md        # one file per draft; id in frontmatter
+#   ├── ideas.md                # all ideas, one section each
+#   ├── reflections.md          # all reflections
+#   ├── topics.md               # ingested headlines
+#   ├── analytics.csv           # numeric per-post metrics
+#   └── manifest.json           # row counts + schema_version
+#
+# Identity for round-trip:
+#   - drafts / ideas / reflections / analytics: frontmatter or CSV `id` is
+#     the binding. UPSERT to that id on import; INSERT new if id missing
+#     or doesn't match.
+#   - pillars / topic_sources: name / url as the natural key (matches
+#     profile.md behaviour).
+#   - voice samples: content hash; re-import is a no-op.
+#
+# Import semantics — additive, never destructive. Same rule as profile.md
+# but extended to the content tail. To wipe and replace, use the JSON
+# backup with mode=replace.
+#
+# The API key is NEVER exported. The manifest includes a schema_version;
+# imports refuse archives from a newer schema than the running app.
+# ---------------------------------------------------------------------------
+
+import csv as _csv_mod  # alias to avoid shadowing local `csv` vars elsewhere
+import io as _io_mod
+import re as _re_mod
+import zipfile as _zip_mod
+
+MARKDOWN_BACKUP_FORMAT_VERSION = 1
+
+
+def _slugify(text: str, max_len: int = 60) -> str:
+    """Lowercase, dashes, alphanumeric-only slug. Used for draft filenames."""
+    s = (text or "").lower()
+    s = _re_mod.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    if not s:
+        s = "untitled"
+    return s[:max_len].rstrip("-")
+
+
+def _draft_filename(row: dict) -> str:
+    """drafts/NNNN-slug.md — id-prefixed for stable round-trip."""
+    title = row.get("title") or ""
+    if not title.strip():
+        body = (row.get("body") or "").strip()
+        title = body.split("\n", 1)[0] if body else ""
+    return f"{int(row['id']):04d}-{_slugify(title)}.md"
+
+
+def _draft_to_markdown(row: dict, pillar_name: str | None = None) -> str:
+    """Serialize one draft row to a markdown file with YAML-style frontmatter.
+
+    Frontmatter holds all metadata (id, pillar, scores, timestamps). The
+    body after the closing `---` is the post text verbatim — markdown
+    inside the body never confuses the parser because we read to
+    end-of-file, not until the next H2."""
+    fm = [
+        "---",
+        f"id: {int(row['id'])}",
+        f"title: {row.get('title') or ''}",
+        f"status: {row.get('status') or 'draft'}",
+        f"format: {row.get('format') or 'story'}",
+    ]
+    if pillar_name:
+        fm.append(f"pillar: {pillar_name}")
+    if row.get("idea_id"):
+        fm.append(f"idea_id: {int(row['idea_id'])}")
+    for k in ("hook_score", "voice_score"):
+        v = row.get(k)
+        if v is not None and v != "":
+            fm.append(f"{k}: {v}")
+    if row.get("score_notes"):
+        fm.append(f"score_notes: {row['score_notes']}")
+    for k in ("scheduled_for", "posted_at", "created_at", "updated_at"):
+        v = row.get(k)
+        if v:
+            fm.append(f"{k}: {v}")
+    fm.append("---")
+    body = (row.get("body") or "").rstrip() + "\n"
+    title_line = (row.get("title") or "Untitled").replace("\n", " ").strip()[:120]
+    return "\n".join(fm) + f"\n\n# {title_line}\n\n{body}"
+
+
+def _parse_draft_markdown(text: str) -> dict:
+    """Parse one draft .md file. Returns a dict shaped like a `drafts` row."""
+    lines = text.splitlines()
+    i = 0
+    fm: dict[str, str] = {}
+    if i < len(lines) and lines[i].strip() == "---":
+        i += 1
+        while i < len(lines) and lines[i].strip() != "---":
+            line = lines[i]
+            if ":" in line:
+                k, _, v = line.partition(":")
+                fm[k.strip().lower()] = v.strip()
+            i += 1
+        if i < len(lines) and lines[i].strip() == "---":
+            i += 1
+    # Skip decorative H1 and surrounding blank lines.
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and lines[i].startswith("# "):
+        i += 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+    body = "\n".join(lines[i:]).strip()
+    return {
+        "id": _safe_int(fm.get("id"), 0),
+        "title": fm.get("title") or "",
+        "status": fm.get("status") or "draft",
+        "format": fm.get("format") or "story",
+        "pillar_name": fm.get("pillar") or "",
+        "idea_id": _safe_int(fm.get("idea_id"), 0) or None,
+        "hook_score": _safe_int(fm.get("hook_score"), 0) or None,
+        "voice_score": _safe_int(fm.get("voice_score"), 0) or None,
+        "score_notes": fm.get("score_notes") or "",
+        "scheduled_for": fm.get("scheduled_for") or None,
+        "posted_at": fm.get("posted_at") or None,
+        "created_at": fm.get("created_at") or None,
+        "updated_at": fm.get("updated_at") or None,
+        "body": body,
+    }
+
+
+def _ideas_to_markdown(rows: list[dict]) -> str:
+    """All ideas in one file, one H2 per idea."""
+    out = ["# Ideas", ""]
+    if not rows:
+        out.append("_(no ideas yet)_")
+        return "\n".join(out) + "\n"
+    for r in rows:
+        pillar = r.get("pillar_name") or "(no pillar)"
+        out.append(f"## Idea {int(r['id'])} — {pillar}")
+        out.append(f"- id: {int(r['id'])}")
+        out.append(f"- status: {r.get('status') or 'raw'}")
+        if r.get("pillar_name"):
+            out.append(f"- pillar: {r['pillar_name']}")
+        if r.get("source"):
+            out.append(f"- source: {r['source']}")
+        if r.get("created_at"):
+            out.append(f"- created_at: {r['created_at']}")
+        out.append("")
+        if r.get("hook"):
+            out.append(f"**Hook:** {r['hook']}")
+            out.append("")
+        if r.get("angle"):
+            out.append("**Angle:**")
+            out.append("")
+            out.append(r["angle"])
+            out.append("")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _parse_ideas_markdown(text: str) -> list[dict]:
+    """Walk H2 sections; for each, read bulleted metadata and prose body."""
+    items: list[dict] = []
+    lines = text.splitlines()
+    current: dict | None = None
+    current_body: list[str] = []
+    last_label: str | None = None
+
+    def _flush():
+        nonlocal current, current_body, last_label
+        if current is not None:
+            if last_label and current_body:
+                current[last_label.lower()] = "\n".join(current_body).strip()
+                current_body = []
+            items.append(current)
+        current = None
+        current_body = []
+        last_label = None
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            _flush()
+            current = {"id": 0, "status": "raw", "source": "", "hook": "",
+                       "angle": "", "pillar_name": ""}
+            continue
+        if stripped.startswith("# "):
+            continue
+        if current is None:
+            continue
+        if stripped.startswith("- ") and ":" in stripped:
+            k, _, v = stripped[2:].partition(":")
+            k = k.strip().lower()
+            v = v.strip()
+            if k == "id":
+                current["id"] = _safe_int(v, 0)
+            elif k in ("status", "source"):
+                current[k] = v
+            elif k == "pillar":
+                current["pillar_name"] = v
+            continue
+        if stripped.startswith("**Hook:**"):
+            if last_label and current_body:
+                current[last_label.lower()] = "\n".join(current_body).strip()
+            current_body = []
+            after = stripped.removeprefix("**Hook:**").strip()
+            if after:
+                current["hook"] = after
+                last_label = None
+            else:
+                last_label = "hook"
+            continue
+        if stripped.startswith("**Angle:**"):
+            if last_label and current_body:
+                current[last_label.lower()] = "\n".join(current_body).strip()
+            current_body = []
+            after = stripped.removeprefix("**Angle:**").strip()
+            if after:
+                current["angle"] = after
+                last_label = None
+            else:
+                last_label = "angle"
+            continue
+        if last_label:
+            current_body.append(line)
+    _flush()
+    return [it for it in items if it["id"] or it["hook"] or it["angle"]]
+
+
+def _reflections_to_markdown(rows: list[dict]) -> str:
+    out = ["# Reflections", ""]
+    if not rows:
+        out.append("_(no reflections yet)_")
+        return "\n".join(out) + "\n"
+    for r in rows:
+        when = r.get("created_at") or ""
+        out.append(f"## Reflection {int(r['id'])} — "
+                   f"{when[:10] if when else 'unknown'} — "
+                   f"{r.get('window_days', 7)}-day window")
+        out.append(f"- id: {int(r['id'])}")
+        out.append(f"- window_days: {r.get('window_days', 7)}")
+        if r.get("created_at"):
+            out.append(f"- created_at: {r['created_at']}")
+        out.append("")
+        out.append((r.get("summary") or "").strip() or "_(empty summary)_")
+        out.append("")
+        sig = r.get("signals") or {}
+        if isinstance(sig, str):
+            try:
+                sig = json.loads(sig or "{}")
+            except json.JSONDecodeError:
+                sig = {}
+        if not sig and r.get("signals_json"):
+            try:
+                sig = json.loads(r["signals_json"] or "{}")
+            except json.JSONDecodeError:
+                sig = {}
+        if sig:
+            out.append("Signals:")
+            for k, v in sig.items():
+                out.append(f"- {k}: {v}")
+            out.append("")
+        ideas = r.get("ideas_created") or []
+        if isinstance(ideas, str):
+            try:
+                ideas = json.loads(ideas or "[]")
+            except json.JSONDecodeError:
+                ideas = []
+        if not ideas and r.get("ideas_created_json"):
+            try:
+                ideas = json.loads(r["ideas_created_json"] or "[]")
+            except json.JSONDecodeError:
+                ideas = []
+        if ideas:
+            out.append(f"Ideas created: {', '.join(str(i) for i in ideas)}")
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _parse_reflections_markdown(text: str) -> list[dict]:
+    items: list[dict] = []
+    lines = text.splitlines()
+    current: dict | None = None
+    current_state = "summary"
+    summary_lines: list[str] = []
+    signals: dict[str, str] = {}
+
+    def _flush():
+        nonlocal current, current_state, summary_lines, signals
+        if current is not None:
+            summary_text = "\n".join(summary_lines).strip()
+            if summary_text == "_(empty summary)_":
+                summary_text = ""
+            current["summary"] = summary_text
+            current["signals_json"] = json.dumps(signals) if signals else "{}"
+            items.append(current)
+        current = None
+        current_state = "summary"
+        summary_lines = []
+        signals = {}
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## Reflection"):
+            _flush()
+            current = {"id": 0, "window_days": 7, "summary": "",
+                       "signals_json": "{}", "ideas_created_json": "[]",
+                       "created_at": None}
+            current_state = "summary"
+            continue
+        if stripped.startswith("# "):
+            continue
+        if current is None:
+            continue
+        if stripped == "Signals:":
+            current_state = "signals"
+            continue
+        if stripped.startswith("Ideas created:"):
+            rest = stripped.removeprefix("Ideas created:").strip()
+            ids = [int(x.strip()) for x in rest.split(",")
+                   if x.strip().isdigit()]
+            current["ideas_created_json"] = json.dumps(ids)
+            continue
+        if stripped.startswith("- ") and ":" in stripped:
+            k, _, v = stripped[2:].partition(":")
+            k = k.strip().lower()
+            v = v.strip()
+            if current_state == "signals":
+                signals[k] = v
+            elif k == "id":
+                current["id"] = _safe_int(v, 0)
+            elif k == "window_days":
+                current["window_days"] = _safe_int(v, 7)
+            elif k == "created_at":
+                current["created_at"] = v
+            continue
+        if current_state == "summary":
+            summary_lines.append(line)
+    _flush()
+    return [it for it in items if it["id"] or it["summary"]]
+
+
+def _topics_to_markdown(rows: list[dict]) -> str:
+    out = ["# Topics (ingested headlines)", ""]
+    if not rows:
+        out.append("_(no topics yet)_")
+        return "\n".join(out) + "\n"
+    for r in rows:
+        source = r.get("source_name") or "(unknown)"
+        out.append(f"## Topic {int(r['id'])} — {source}")
+        out.append(f"- id: {int(r['id'])}")
+        if r.get("url"):
+            out.append(f"- url: {r['url']}")
+        if r.get("source_name"):
+            out.append(f"- source: {r['source_name']}")
+        out.append(f"- status: {r.get('status') or 'new'}")
+        if r.get("pillar_name"):
+            out.append(f"- pillar: {r['pillar_name']}")
+        if r.get("idea_id"):
+            out.append(f"- idea_id: {int(r['idea_id'])}")
+        if r.get("published_at"):
+            out.append(f"- published_at: {r['published_at']}")
+        if r.get("ingested_at"):
+            out.append(f"- ingested_at: {r['ingested_at']}")
+        out.append("")
+        out.append(f"**{r.get('title') or '(no title)'}**")
+        out.append("")
+        if r.get("summary"):
+            out.append((r["summary"] or "").strip())
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _parse_topics_markdown(text: str) -> list[dict]:
+    items: list[dict] = []
+    lines = text.splitlines()
+    current: dict | None = None
+    body_lines: list[str] = []
+    seen_title = False
+
+    def _flush():
+        nonlocal current, body_lines, seen_title
+        if current is not None:
+            if body_lines:
+                current["summary"] = "\n".join(body_lines).strip()
+            items.append(current)
+        current = None
+        body_lines = []
+        seen_title = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## Topic"):
+            _flush()
+            current = {"id": 0, "url": "", "status": "new",
+                       "title": "", "summary": ""}
+            continue
+        if stripped.startswith("# "):
+            continue
+        if current is None:
+            continue
+        if stripped.startswith("- ") and ":" in stripped:
+            k, _, v = stripped[2:].partition(":")
+            k = k.strip().lower()
+            v = v.strip()
+            if k == "id":
+                current["id"] = _safe_int(v, 0)
+            elif k in ("url", "status"):
+                current[k] = v
+            continue
+        if (not seen_title and stripped.startswith("**")
+                and stripped.endswith("**")):
+            current["title"] = stripped[2:-2].strip()
+            seen_title = True
+            continue
+        if seen_title:
+            body_lines.append(line)
+    _flush()
+    return [it for it in items if it["url"]]
+
+
+def _analytics_to_csv(rows: list[dict]) -> str:
+    """Tabular metric rows. Markdown tables get too wide for these many
+    columns — CSV is the right format here."""
+    buf = _io_mod.StringIO()
+    cols = ["id", "draft_id", "impressions", "likes", "comments",
+            "reposts", "follows", "profile_visits", "recorded_at"]
+    w = _csv_mod.writer(buf)
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([
+            r.get("id", ""),
+            r.get("draft_id", ""),
+            r.get("impressions", 0),
+            r.get("likes", 0),
+            r.get("comments", 0),
+            r.get("reposts", 0),
+            r.get("follows", 0),
+            r.get("profile_visits", 0),
+            r.get("recorded_at", ""),
+        ])
+    return buf.getvalue()
+
+
+def _parse_analytics_csv(text: str) -> list[dict]:
+    out: list[dict] = []
+    reader = _csv_mod.DictReader(_io_mod.StringIO(text))
+    for row in reader:
+        try:
+            out.append({
+                "id": _safe_int(row.get("id"), 0),
+                "draft_id": _safe_int(row.get("draft_id"), 0),
+                "impressions": _safe_int(row.get("impressions"), 0),
+                "likes": _safe_int(row.get("likes"), 0),
+                "comments": _safe_int(row.get("comments"), 0),
+                "reposts": _safe_int(row.get("reposts"), 0),
+                "follows": _safe_int(row.get("follows"), 0),
+                "profile_visits": _safe_int(row.get("profile_visits"), 0),
+                "recorded_at": (row.get("recorded_at") or "").strip(),
+            })
+        except Exception:
+            continue
+    return out
+
+
+# ---------- Zip packer / unpacker --------------------------------------------
+
+
+def _gather_full_backup_data() -> dict:
+    """One trip to the DB; assemble everything the packer needs."""
+    profile = _gather_profile_data()
+    with db_cursor() as conn:
+        ideas = [dict(r) for r in conn.execute(
+            "SELECT i.*, p.name as pillar_name FROM ideas i "
+            "LEFT JOIN pillars p ON p.id = i.pillar_id "
+            "ORDER BY i.id"
+        ).fetchall()]
+        drafts = [dict(r) for r in conn.execute(
+            "SELECT d.*, p.name as pillar_name FROM drafts d "
+            "LEFT JOIN pillars p ON p.id = d.pillar_id "
+            "ORDER BY d.id"
+        ).fetchall()]
+        reflections = [dict(r) for r in conn.execute(
+            "SELECT * FROM reflections ORDER BY id"
+        ).fetchall()]
+        topics = [dict(r) for r in conn.execute(
+            "SELECT t.*, s.name as source_name, p.name as pillar_name "
+            "FROM topics t "
+            "LEFT JOIN topic_sources s ON s.id = t.source_id "
+            "LEFT JOIN pillars p ON p.id = t.pillar_id "
+            "ORDER BY t.id"
+        ).fetchall()]
+        analytics = [dict(r) for r in conn.execute(
+            "SELECT * FROM analytics ORDER BY id"
+        ).fetchall()]
+    return {
+        "profile": profile,
+        "ideas": ideas, "drafts": drafts,
+        "reflections": reflections, "topics": topics,
+        "analytics": analytics,
+    }
+
+
+def export_markdown_backup_bytes() -> tuple[bytes, dict]:
+    """Build the full markdown backup as a zip. Returns (zip_bytes, counts)."""
+    data = _gather_full_backup_data()
+    manifest = {
+        "exported_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "format_version": MARKDOWN_BACKUP_FORMAT_VERSION,
+        "counts": {
+            "ideas": len(data["ideas"]),
+            "drafts": len(data["drafts"]),
+            "reflections": len(data["reflections"]),
+            "topics": len(data["topics"]),
+            "analytics": len(data["analytics"]),
+            "pillars": len(data["profile"]["pillars"]),
+            "voice_samples": len(data["profile"]["voice_samples"]),
+            "topic_sources": len(data["profile"]["topic_sources"]),
+        },
+    }
+    counts = dict(manifest["counts"])
+
+    buf = _io_mod.BytesIO()
+    with _zip_mod.ZipFile(buf, "w", _zip_mod.ZIP_DEFLATED) as zf:
+        root = f"cadence-backup-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        zf.writestr(f"{root}/manifest.json",
+                    json.dumps(manifest, indent=2, ensure_ascii=False))
+        zf.writestr(f"{root}/profile.md",
+                    _profile_to_markdown(data["profile"]))
+        zf.writestr(f"{root}/ideas.md",
+                    _ideas_to_markdown(data["ideas"]))
+        zf.writestr(f"{root}/reflections.md",
+                    _reflections_to_markdown(data["reflections"]))
+        zf.writestr(f"{root}/topics.md",
+                    _topics_to_markdown(data["topics"]))
+        zf.writestr(f"{root}/analytics.csv",
+                    _analytics_to_csv(data["analytics"]))
+        seen_names: set[str] = set()
+        for d in data["drafts"]:
+            fname = _draft_filename(d)
+            base = fname
+            suffix = 2
+            while fname in seen_names:
+                fname = base.removesuffix(".md") + f"-{suffix}.md"
+                suffix += 1
+            seen_names.add(fname)
+            zf.writestr(
+                f"{root}/drafts/{fname}",
+                _draft_to_markdown(d, pillar_name=d.get("pillar_name")),
+            )
+    return buf.getvalue(), counts
+
+
+def _read_zip_member(zf: _zip_mod.ZipFile, name: str) -> str | None:
+    """Return a text member's content if present, else None. Handles the
+    optional top-level folder prefix automatically."""
+    candidates = [name]
+    roots = {n.split("/", 1)[0] for n in zf.namelist() if "/" in n}
+    if len(roots) == 1:
+        candidates = [f"{next(iter(roots))}/{name}"] + candidates
+    for c in candidates:
+        try:
+            return zf.read(c).decode("utf-8")
+        except KeyError:
+            continue
+    return None
+
+
+def _zip_drafts_files(zf: _zip_mod.ZipFile) -> list[str]:
+    roots = {n.split("/", 1)[0] for n in zf.namelist() if "/" in n}
+    prefix = ""
+    if len(roots) == 1:
+        prefix = next(iter(roots)) + "/"
+    return [
+        n for n in zf.namelist()
+        if n.startswith(f"{prefix}drafts/") and n.endswith(".md")
+        and not n.endswith("/")
+    ]
+
+
+def import_markdown_backup_bytes(zip_bytes: bytes) -> dict:
+    """Apply a markdown backup zip to the DB. Additive UPSERT semantics.
+    Raises ValueError on schema-version mismatch or unreadable archive."""
+    try:
+        zf = _zip_mod.ZipFile(_io_mod.BytesIO(zip_bytes))
+    except _zip_mod.BadZipFile as e:
+        raise ValueError(f"Not a valid zip archive: {e}")
+
+    manifest_text = _read_zip_member(zf, "manifest.json")
+    if manifest_text:
+        try:
+            manifest = json.loads(manifest_text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"manifest.json is malformed: {e}")
+        v = int(manifest.get("schema_version") or 0)
+        if v > CURRENT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Backup is from a newer schema (v{v}); current app is "
+                f"v{CURRENT_SCHEMA_VERSION}. Update the app first."
+            )
+
+    counts: dict[str, int] = {
+        "profile_settings_updated": 0,
+        "pillars_inserted": 0, "pillars_updated": 0,
+        "voice_inserted": 0, "voice_skipped": 0,
+        "sources_inserted": 0, "sources_updated": 0,
+        "ideas_inserted": 0, "ideas_updated": 0,
+        "drafts_inserted": 0, "drafts_updated": 0,
+        "reflections_inserted": 0, "reflections_updated": 0,
+        "topics_inserted": 0, "topics_updated": 0,
+        "analytics_inserted": 0, "analytics_updated": 0,
+    }
+    warnings: list[str] = []
+
+    profile_md = _read_zip_member(zf, "profile.md")
+    if profile_md:
+        parsed_profile = _parse_profile_markdown(profile_md)
+        pcounts = _apply_profile_dict(parsed_profile)
+        counts["profile_settings_updated"] = pcounts["settings_updated"]
+        counts["pillars_inserted"] = pcounts["pillars_inserted"]
+        counts["pillars_updated"] = pcounts["pillars_updated"]
+        counts["voice_inserted"] = pcounts["voice_inserted"]
+        counts["voice_skipped"] = pcounts["voice_skipped_duplicates"]
+        counts["sources_inserted"] = pcounts["sources_inserted"]
+        counts["sources_updated"] = pcounts["sources_updated"]
+        warnings.extend(pcounts.get("warnings") or [])
+
+    ideas_md = _read_zip_member(zf, "ideas.md")
+    if ideas_md:
+        with db_cursor() as conn:
+            pillar_id_by_name = {
+                r["name"].lower(): r["id"]
+                for r in conn.execute("SELECT id, name FROM pillars").fetchall()
+            }
+            for it in _parse_ideas_markdown(ideas_md):
+                pid = pillar_id_by_name.get(
+                    (it.get("pillar_name") or "").lower()
+                )
+                row = conn.execute(
+                    "SELECT id FROM ideas WHERE id=?", (it["id"],)
+                ).fetchone() if it["id"] else None
+                if row:
+                    conn.execute(
+                        "UPDATE ideas SET pillar_id=?, hook=?, angle=?, "
+                        "source=?, status=? WHERE id=?",
+                        (pid, it.get("hook") or "",
+                         it.get("angle") or "", it.get("source") or "",
+                         it.get("status") or "raw", it["id"]),
+                    )
+                    counts["ideas_updated"] += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO ideas(pillar_id, title, hook, angle, "
+                        "source, status) VALUES (?, ?, ?, ?, ?, ?)",
+                        (pid, (it.get("hook") or "")[:200],
+                         it.get("hook") or "",
+                         it.get("angle") or "",
+                         it.get("source") or "import-md",
+                         it.get("status") or "raw"),
+                    )
+                    counts["ideas_inserted"] += 1
+
+    for member in _zip_drafts_files(zf):
+        try:
+            raw = zf.read(member).decode("utf-8")
+        except Exception as e:
+            warnings.append(f"Couldn't read {member}: {e}")
+            continue
+        d = _parse_draft_markdown(raw)
+        with db_cursor() as conn:
+            pillar_id = None
+            if d.get("pillar_name"):
+                pr = conn.execute(
+                    "SELECT id FROM pillars WHERE LOWER(name)=LOWER(?)",
+                    (d["pillar_name"],),
+                ).fetchone()
+                if pr:
+                    pillar_id = pr["id"]
+            row = conn.execute(
+                "SELECT id FROM drafts WHERE id=?", (d["id"],)
+            ).fetchone() if d["id"] else None
+            if row:
+                conn.execute(
+                    "UPDATE drafts SET idea_id=?, pillar_id=?, title=?, "
+                    "body=?, format=?, hook_score=?, voice_score=?, "
+                    "score_notes=?, status=?, scheduled_for=?, posted_at=? "
+                    "WHERE id=?",
+                    (d.get("idea_id"), pillar_id, d.get("title") or "",
+                     d.get("body") or "", d.get("format") or "story",
+                     d.get("hook_score"), d.get("voice_score"),
+                     d.get("score_notes") or "",
+                     d.get("status") or "draft",
+                     d.get("scheduled_for"), d.get("posted_at"),
+                     d["id"]),
+                )
+                counts["drafts_updated"] += 1
+            else:
+                conn.execute(
+                    "INSERT INTO drafts(idea_id, pillar_id, title, body, "
+                    "format, hook_score, voice_score, score_notes, status, "
+                    "scheduled_for, posted_at) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (d.get("idea_id"), pillar_id, d.get("title") or "",
+                     d.get("body") or "", d.get("format") or "story",
+                     d.get("hook_score"), d.get("voice_score"),
+                     d.get("score_notes") or "",
+                     d.get("status") or "draft",
+                     d.get("scheduled_for"), d.get("posted_at")),
+                )
+                counts["drafts_inserted"] += 1
+
+    refl_md = _read_zip_member(zf, "reflections.md")
+    if refl_md:
+        with db_cursor() as conn:
+            for r in _parse_reflections_markdown(refl_md):
+                existing = conn.execute(
+                    "SELECT id FROM reflections WHERE id=?", (r["id"],)
+                ).fetchone() if r["id"] else None
+                if existing:
+                    conn.execute(
+                        "UPDATE reflections SET window_days=?, summary=?, "
+                        "signals_json=?, ideas_created_json=? WHERE id=?",
+                        (r["window_days"], r["summary"],
+                         r["signals_json"], r["ideas_created_json"],
+                         r["id"]),
+                    )
+                    counts["reflections_updated"] += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO reflections(window_days, summary, "
+                        "signals_json, ideas_created_json) "
+                        "VALUES (?, ?, ?, ?)",
+                        (r["window_days"], r["summary"],
+                         r["signals_json"], r["ideas_created_json"]),
+                    )
+                    counts["reflections_inserted"] += 1
+
+    topics_md = _read_zip_member(zf, "topics.md")
+    if topics_md:
+        with db_cursor() as conn:
+            for t in _parse_topics_markdown(topics_md):
+                row = conn.execute(
+                    "SELECT id FROM topics WHERE id=?", (t["id"],)
+                ).fetchone() if t.get("id") else None
+                if row:
+                    conn.execute(
+                        "UPDATE topics SET url=?, title=?, summary=?, "
+                        "status=? WHERE id=?",
+                        (t["url"], t.get("title") or "",
+                         t.get("summary") or "",
+                         t.get("status") or "new", t["id"]),
+                    )
+                    counts["topics_updated"] += 1
+                else:
+                    try:
+                        conn.execute(
+                            "INSERT INTO topics(url, title, summary, status) "
+                            "VALUES (?, ?, ?, ?)",
+                            (t["url"], t.get("title") or "",
+                             t.get("summary") or "",
+                             t.get("status") or "new"),
+                        )
+                        counts["topics_inserted"] += 1
+                    except sqlite3.IntegrityError:
+                        warnings.append(
+                            f"Topic url already exists, skipped: {t['url']}"
+                        )
+
+    analytics_csv = _read_zip_member(zf, "analytics.csv")
+    if analytics_csv:
+        with db_cursor() as conn:
+            for r in _parse_analytics_csv(analytics_csv):
+                if not r["draft_id"]:
+                    warnings.append("Analytics row missing draft_id; skipped.")
+                    continue
+                row = conn.execute(
+                    "SELECT id FROM analytics WHERE id=?", (r["id"],)
+                ).fetchone() if r["id"] else None
+                if row:
+                    conn.execute(
+                        "UPDATE analytics SET draft_id=?, impressions=?, "
+                        "likes=?, comments=?, reposts=?, follows=?, "
+                        "profile_visits=? WHERE id=?",
+                        (r["draft_id"], r["impressions"], r["likes"],
+                         r["comments"], r["reposts"], r["follows"],
+                         r["profile_visits"], r["id"]),
+                    )
+                    counts["analytics_updated"] += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO analytics(draft_id, impressions, "
+                        "likes, comments, reposts, follows, profile_visits) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (r["draft_id"], r["impressions"], r["likes"],
+                         r["comments"], r["reposts"], r["follows"],
+                         r["profile_visits"]),
+                    )
+                    counts["analytics_inserted"] += 1
+
+    counts["warnings"] = warnings
+    return counts
+
+
+@app.get("/api/backup/export-markdown")
+def api_backup_export_markdown():
+    zip_bytes, _ = export_markdown_backup_bytes()
+    fname = f"cadence-backup-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.zip"
+    return (
+        zip_bytes,
+        200,
+        {
+            "Content-Type": "application/zip",
+            "Content-Disposition": f'attachment; filename="{fname}"',
+        },
+    )
+
+
+@app.post("/api/backup/import-markdown")
+def api_backup_import_markdown():
+    """Body: {zip_base64: "..."}. Base64-in-JSON keeps the frontend path
+    simple (FileReader -> base64 -> JSON POST) and avoids multipart."""
+    import base64
+    payload = request.get_json(silent=True) or {}
+    b64 = payload.get("zip_base64", "")
+    if not b64:
+        return jsonify({"error": "zip_base64 required"}), 400
+    try:
+        zip_bytes = base64.b64decode(b64)
+    except Exception as e:
+        return jsonify({"error": f"bad base64: {e}"}), 400
+    try:
+        counts = import_markdown_backup_bytes(zip_bytes)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, **counts})
+
+
+# ---------------------------------------------------------------------------
 # Routes — pillars
 # ---------------------------------------------------------------------------
 
@@ -3696,6 +4539,39 @@ def _cli_import(path: str, *, mode: str, yes: bool) -> int:
     return 0
 
 
+def _cli_backup_export_md(path: str) -> int:
+    """Write the markdown backup zip to disk."""
+    zip_bytes, counts = export_markdown_backup_bytes()
+    Path(path).write_bytes(zip_bytes)
+    total = sum(counts.values())
+    print(f"Wrote markdown backup zip to {path} ({total} rows total)")
+    for k, v in counts.items():
+        print(f"  {k}: {v}")
+    print("Open the zip and edit any file freely. Re-import with "
+          "`python app.py backup import-md <path>`.")
+    return 0
+
+
+def _cli_backup_import_md(path: str) -> int:
+    p = Path(path)
+    if not p.exists():
+        print(f"File not found: {path}", file=sys.stderr)
+        return 2
+    try:
+        counts = import_markdown_backup_bytes(p.read_bytes())
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    print(f"Imported markdown backup from {path}.")
+    for k, v in counts.items():
+        if k == "warnings":
+            continue
+        print(f"  {k}: {v}")
+    for w in counts.get("warnings") or []:
+        print(f"  warning: {w}")
+    return 0
+
+
 def _cli_profile_export(path: str) -> int:
     data = _gather_profile_data()
     md = _profile_to_markdown(data)
@@ -3777,6 +4653,25 @@ def _build_cli() -> argparse.ArgumentParser:
     )
     p_pi.add_argument("path", help="Input markdown path")
 
+    p_backup = sub.add_parser(
+        "backup",
+        help="Markdown-format full backup (.zip with profile.md, "
+             "drafts/*.md, ideas.md, reflections.md, topics.md, "
+             "analytics.csv, manifest.json). Companion to the JSON "
+             "backup; human-readable and git-friendly.",
+    )
+    p_backup_sub = p_backup.add_subparsers(dest="backup_cmd")
+    p_be = p_backup_sub.add_parser(
+        "export-md", help="Save markdown backup zip to a path."
+    )
+    p_be.add_argument("path", help="Output .zip path (e.g. backup.zip)")
+    p_bi = p_backup_sub.add_parser(
+        "import-md",
+        help="Apply a markdown backup zip. Additive: every table upserts "
+             "by id (or name/url for pillars/sources); nothing is deleted.",
+    )
+    p_bi.add_argument("path", help="Input .zip path")
+
     sub.add_parser("serve", help="Start the web server (default).")
     return parser
 
@@ -3797,6 +4692,13 @@ if __name__ == "__main__":
             sys.exit(_cli_profile_import(args.path))
         # No subcommand given — print help
         parser.parse_args(["profile", "--help"])
+        sys.exit(2)
+    if args.cmd == "backup":
+        if args.backup_cmd == "export-md":
+            sys.exit(_cli_backup_export_md(args.path))
+        if args.backup_cmd == "import-md":
+            sys.exit(_cli_backup_import_md(args.path))
+        parser.parse_args(["backup", "--help"])
         sys.exit(2)
     # Default: serve
     port = int(os.getenv("PORT", "5050"))

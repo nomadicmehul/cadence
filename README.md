@@ -107,7 +107,44 @@ Import is **additive**: pillars and topic sources upsert by name / URL,
 voice samples append (no duplicates), nothing in the DB is deleted just
 because it's missing from the file. Use Option A for a full wipe-and-replace.
 
-### Option C — copy the SQLite file
+### Option C — full backup as a `.zip` of markdown files (human-editable)
+
+Same data as Option A, but each draft / idea / reflection is its own
+readable file in a zip. Edit individual posts in any text editor, commit
+the folder to git for version-controlled history.
+
+```bash
+# Export
+python app.py backup export-md ~/Desktop/cadence-backup.zip
+# Or click "Download backup (.zip)" in Settings → Backup & migrate
+
+# Unzip, edit any file in your text editor, re-zip
+
+# Load back
+python app.py backup import-md ~/Desktop/cadence-backup.zip
+# Or click "Restore from .zip…" in Settings → Backup & migrate
+```
+
+Archive layout:
+
+```
+cadence-backup-YYYYMMDD/
+├── profile.md            # creator profile (Option B's file)
+├── drafts/
+│   └── 0042-some-title.md
+├── ideas.md
+├── reflections.md
+├── topics.md
+├── analytics.csv         # tabular data stays tabular
+└── manifest.json         # row counts + schema_version
+```
+
+Import is **additive** like Option B but extended to the content tail:
+drafts / ideas / reflections / analytics UPSERT by their `id` field;
+pillars / sources upsert by name / URL. Nothing is deleted just because
+it's missing from the archive.
+
+### Option D — copy the SQLite file
 
 If you trust both machines and don't need the JSON-readable history:
 
@@ -137,7 +174,7 @@ gracefully.
 | **Analytics** | Log impressions/likes/comments/follows per published post. Import LinkedIn's Creator Analytics xlsx export. Auto-matches rows to your drafts. **What's working?** gives a one-paragraph Claude analysis. |
 | **Engagement** | Task list for comments + follow-ups. Comment generator writes 3 thoughtful comments for any post text you paste in. Comments now match your voice samples (the voice block is injected on every call). URL-only input is rejected with a clear error — Cadence can't fetch LinkedIn URLs. |
 | **Voice** | Library of your past posts. Claude samples 3 at random for every generation, so the AI writes in *your* rhythm, not generic AI prose. |
-| **Settings** | API key, creator profile, pillars (with target % and color), backup/restore. |
+| **Settings** | API key, **model picker** (Opus 4.5 / Sonnet 4.5 / Haiku 4.5 or pin a custom version; setting persists across restarts, top-bar pill shows what's live), creator profile, content pillars (with target % and color). Backup &amp; migrate offers three formats: **JSON** for full machine round-trips, **`profile.md`** for human-editable settings + pillars + voice + sources, **markdown `.zip`** for the whole DB with one file per draft (git-friendly). |
 
 ---
 
@@ -187,6 +224,16 @@ See [ROADMAP.md](ROADMAP.md) for the full status.
   Cadence finds the feed for you).
 - Comment generator now injects voice samples on every call and rejects
   URL-only input with an actionable error.
+- **Live model picker.** Switch between Opus 4.5, Sonnet 4.5, Haiku 4.5,
+  or pin a specific version from Settings → AI backend. The DB-saved
+  choice wins over the `CLAUDE_MODEL` env var; the top-bar pill shows
+  which model is active per generation.
+- **Human-editable backups.** `profile.md` round-trips your creator
+  profile, content pillars, voice samples, and topic sources as plain
+  markdown with YAML-style frontmatter. The markdown `.zip` archive
+  extends that to the whole DB, with one file per draft so edits in any
+  text editor become single-line diffs in git. Both imports are
+  **additive** (UPSERT, never delete) so they're safe to re-run.
 
 **Still planned:**
 - Semantic memory via embeddings (so discarded patterns dedupe by meaning,

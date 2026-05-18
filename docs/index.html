@@ -428,10 +428,18 @@
 
       <div class="card">
         <div class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 10v6m11-11h-6M7 12H1m15.5-7.5l-4.2 4.2M7.7 16.3l-4.2 4.2m0-16l4.2 4.2m8.6 8.6l4.2 4.2"/></svg>
+        </div>
+        <h3>Switch models without a restart</h3>
+        <p>Pick Opus 4.5, Sonnet 4.5, Haiku 4.5, or pin a specific version from Settings. The UI choice wins over the env var, persists across restarts, and the top bar pill shows which model is live for every generation.</p>
+      </div>
+
+      <div class="card">
+        <div class="ico" aria-hidden="true">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
         </div>
-        <h3>Backup &amp; migrate</h3>
-        <p>Move your entire pipeline between machines as a JSON file in 60 seconds. API key is redacted by default. CLI, HTTP, and one-click UI all share the same code path.</p>
+        <h3>Backup three ways</h3>
+        <p>JSON backup for full machine round-trips. <code>profile.md</code> for git-versioning your creator profile, pillars, and voice samples. Markdown <code>.zip</code> archive with one file per draft so a typo fix is a one-line diff. Editable in any text editor. API key never written.</p>
       </div>
 
     </div>
@@ -524,9 +532,11 @@ cd cadence
         </div>
         <h3>Shipped</h3>
         <p>
-          Onboarding · pillars · schema migrations · JSON backup · weekly
-          brain reflection · RSS topic intake with autodiscovery ·
-          voice-matched comments · memory feedback loop.
+          Onboarding · pillars · schema migrations · JSON backup ·
+          weekly brain reflection · RSS topic intake with HTML feed
+          autodiscovery · voice-matched comments · memory feedback loop ·
+          live model picker (Opus / Sonnet / Haiku) · human-editable
+          <code>profile.md</code> + markdown <code>.zip</code> backup.
         </p>
       </div>
       <div class="card" style="border-color: rgba(251, 191, 36, 0.35)">
